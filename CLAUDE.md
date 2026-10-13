@@ -26,6 +26,9 @@ python test_spectrogram.py
 # 入口②：实时麦克风（三块图 + 流式识别）
 python realtime_mic_monitor.py
 
+# 入口③：mini 版实时麦克风（无界面、纯 print；不依赖 Qt，权重自动定位）
+python -I test_mic_asr_mini.py --seconds 8
+
 # 无界面跑一次识别；--frontend ours|knf|both
 python -I src/asr_onnx_decode.py --model-dir weight/<权重目录> --frontend both
 
@@ -33,6 +36,7 @@ python -I src/asr_onnx_decode.py --model-dir weight/<权重目录> --frontend bo
 python -I scripts/smoke_test_spectrogram.py     # 离线链路 offscreen 冒烟，含帧间隔统计
 python -I scripts/smoke_test_mic_audio.py       # 假 InputStream 按 1x 速度回放真实 wav
 python -I scripts/smoke_test_mic_monitor.py     # 真开麦克风跑 N 秒（默认 8s）后自动退出
+python -I scripts/verify_mini.py                # mini/ 与 src/ 逐点对拍（--part a|b|ab）
 python -I scripts/probe_align_features.py <wav> ...
 python -I scripts/probe_streaming_features.py <wav> ...
 python -I scripts/probe_mel_iterate.py          # numpy 复现 InitKaldiMelBanks 并逐点比对
@@ -63,6 +67,15 @@ PortAudio 回调线程 ──audio_q(Queue)──> Qt 主线程 ──worker.fee
 | `src/console_utf8.py` | 把 stdout/stderr 切成 UTF-8，单独拆出来是为了让 `scripts/` 也能用而不拖进 onnxruntime |
 
 两个 GUI 入口（`test_spectrogram.py`、`realtime_mic_monitor.py`）都只是「配置 + 数据源」，识别类与绘图控件各只有一份实现。
+
+### mini/ 是平行的另一套实现，不是 src/ 的重构目标
+
+`mini/`（`audio_preprocess.py` / `asr_decode.py` / `mic_client.py` + 入口 `test_mic_asr_mini.py`）是为**学习和 C++ 移植**另写的：显式逐帧循环、三类零耦合、不 `import src/` 任何模块、不用 Qt 也不自己起 Python 线程（麦克风走 PortAudio 回调，主循环用 `get_last_audio()` 主动拉取）。它复刻同样的 kaldi 前端口径与解码不变量，但代码组织完全不同。
+
+两条硬规矩：
+
+- **改 `src/` 时不要顺手改 `mini/`，反之亦然。** 两边互相独立，正是 `scripts/verify_mini.py` 能当数值标尺的前提——一旦让其中一边 import 另一边，对拍就退化成自比自，失去意义。
+- **`mini/` 的 `get_last_audio()` 取走累积的全部样本**，与 `src/streaming_asr.py` 队列满时「丢最旧块」是刻意的反向取舍：前者要波形连续无损（慢一点只是延迟变大），后者要 GUI 画面低延迟。别把两边改成一致。
 
 ### 必须记住的不变量
 

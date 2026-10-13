@@ -11,7 +11,7 @@
 
 **目标**：不依赖 sherpa-onnx 运行时，用**自研传统预处理模块**（`../src/traditional_features.py`）产出模型输入，用 **onnxruntime** 完成推理与后处理，跑通「离线批量」与「实时流式」两条语音识别链路。
 
-**结论：两条链路都已跑通。** 在权重包自带的四个测试音频上，自研前端与 `kaldi_native_fbank` 参考实现的识别结果**逐 token 完全相同**；流式链路（按 160 样本一块喂）产出的 token 序列与离线批量链路**也逐位相同**。
+**结论：两条链路都已跑通。** 在权重包自带的四个测试音频上，自研前端与 `kaldi_native_fbank` 参考实现的识别结果**逐 token 完全相同**；流式链路（按 160 样本一块喂）产出的 token 序列与离线批量链路**也逐位相同**。此外 `mini/`（第六节末尾）作为同一件事的第三种独立写法，与 `src/` 同样逐位吻合。
 
 | 指标 | 实测结果 |
 |---|---|
@@ -19,10 +19,14 @@
 | 四条测试音频识别一致性 | **4/4 逐 token 相同** |
 | 流式 vs 批量（分帧层 / 特征层） | **逐位相同（max\|Δ\| = 0）** |
 | 流式 vs 批量（token 序列） | **4/4 完全一致** |
+| `mini/` 独立重写 vs `src/`（前端） | **逐位相同（max\|Δ\| = 0）** |
+| `mini/` 独立重写 vs `src/`（token 序列） | **4/4 完全一致** |
 | 离线实时率 RTF（单线程 CPU，int8 权重） | 0.059 ~ 0.068 |
+| 实时识别 RTF（`mini/` 流式链路） | ≈ 0.10 |
 | 流式峰值负载（单次喂 encoder / 喂间隔） | 6 ~ 9% |
 | 模型会话加载耗时 | ≈ 1.5 s |
 | 端到端运行时依赖 | `onnxruntime` + `numpy` + `soundfile`（**不再需要** `kaldi_native_fbank`） |
+| `mini/` 端到端运行时依赖 | `onnxruntime` + `numpy` + `sounddevice` |
 
 也就是说，`kaldi_native_fbank` 在本项目中从此只保留「数值标尺」这一个用途，交付形态不依赖它。
 
@@ -414,6 +418,24 @@ I/O 通路验证（`--mic --seconds 2`），静音环境：
 
 采集线程有两条铁律（`realtime_mic_monitor.py` 里踩过）：回调线程里**只能**做一次 `.copy()` 再塞进缓冲（PortAudio 会复用 `indata` 的底层缓冲，不 copy 会读到脏数据），且消费端跟不上时丢**最旧**的块（`deque(maxlen=...)`）—— 实时识别要的是「现在」，堆积只会让延迟越来越大。
 
+### 6.5 `mini/`：同一件事的第三种写法
+
+`src/` 的流式实现是为生产写的：分层抽象、跨模块复用（`StreamingFramer` 只接管分帧，帧内处理全部复用批量版）。它跑得对，但读者要在多个文件间来回跳才能拼出「一帧音频到一段文字」的完整路径，不利于学习与 C++ 移植。
+
+`mini/` 因此另写了一套：三个类零耦合（`AudioPreprocess` / `AsrDecoder` / `MicClient`），**不 import `src/` 任何模块**；前端与推理全部写成显式逐帧循环（去直流 → 逐帧倒序预加重 → 加窗 → FFT → 功率谱 → Mel 滤波 → log），不用 Qt、不起 Python 线程、不引入 scipy（窗函数手算）。复刻的是同样的 kaldi 口径与解码不变量，但代码组织完全不同。
+
+它同时是第三把数值标尺 —— 独立重写、且不共享任何一行代码，与 `src/` 一致才能说明两份实现都没写错。`scripts/verify_mini.py` 逐点对拍：
+
+| 对拍项 | 覆盖范围 | 结果 |
+|---|---|---|
+| 前端 vs `frontend_for_onnx` | 4 段真实音频 × 块长 160/257/400/1000/一次全喂；短信号 n = 0/60/79/80/120/139/140/141/280/281（含 `edge` 退化分支） | `max\|Δ\| = 0`，**逐位相同** |
+| 解码 token 序列 vs 批量 | 4 段音频 × 每次喂 1/7/37 帧/一次全喂 | **完全一致**，chunk 数与 encoder 帧数也逐项相同 |
+| 实时麦克风 | RTF ≈ 0.10 | 识别正确，丢块 0 |
+
+逐位相同是能解释的：两边在实现细节上唯一的差异，只有 Mel 能量的求和次序（`power @ filters.T` 走 BLAS，mini 用显式稀疏累加）与功率谱的算法（`np.abs(z)**2` vs `real² + imag²`）。这些都只差最后几个 bit，在 float64 下实测为 0。
+
+**一处刻意的反向取舍**：`MicClient.get_last_audio()` 取走的是自上次调用以来累积的**全部**样本，与 6.4 节 `streaming_asr.py` 的「丢最旧块」相反。两边目标不同 —— GUI 那条线要画面低延迟，mini 要波形连续无损。只保留最新一块会让两次拉取之间的 30 ms 语音出现断口，去直流与预加重会把断口当突变，Mel 谱错乱、吞字。
+
 ---
 
 ## 七、关键文件与用法
@@ -434,15 +456,26 @@ I/O 通路验证（`--mic --seconds 2`），静音环境：
 | `../scripts/smoke_test_spectrogram.py` | 离线链路冒烟：offscreen 跑完整「播放 + 三图 + 识别」，并统计帧间隔 |
 | `../scripts/smoke_test_mic_audio.py` | 麦克风链路冒烟：假 `InputStream` 按 1× 速度回放真实 wav，`realtime_mic_monitor.py` 一行不改地跑完 |
 | `../scripts/smoke_test_mic_monitor.py` | 麦克风链路冒烟：真开麦克风跑 N 秒后自动退出（验证设备与回调线程） |
+| `../scripts/verify_mini.py` | `mini/` 与 `src/` 逐点对拍（前端特征 + token 序列；`--part a\|b\|ab`） |
 | `../decode_result.txt` | 最近一次解码输出（UTF-8） |
 
 上面是核心库，都在 `src/` 下；命令行入口仍是 `src/` 里的模块（`python -I src/xxx.py`）。
-项目根目录只留两个 GUI 入口，它们会把 `src/` 加进 `sys.path` 后直接 import 核心库：
+
+`mini/` 是与 `src/` 平行的**另一套自包含实现**（见 6.5 节），两者互不引用 —— `mini/` 不 import `src/`，`src/` 也不知道 `mini/` 的存在：
+
+| 文件 | 职责 |
+|---|---|
+| `../mini/audio_preprocess.py` | `AudioPreprocess`：波形块 → LogFBank 特征（显式逐帧循环） |
+| `../mini/asr_decode.py` | `AsrDecoder`：特征 → 文本（三个 session + 贪心搜索 + 文本还原） |
+| `../mini/mic_client.py` | `MicClient`：回调采集 + `get_last_audio()` 拉取累积样本 |
+
+项目根目录留三个入口，它们各自把 `src/` 或 `mini/` 加进 `sys.path` 后再 import：
 
 | 根目录入口 | 职责 |
 |---|---|
 | `../test_spectrogram.py` | 离线：播一条 aishell1 样本，边放边显示三块图 + 流式识别文字 |
 | `../realtime_mic_monitor.py` | 实时：麦克风采音，三块图 + 流式识别文字同屏 |
+| `../test_mic_asr_mini.py` | 实时：`mini/` 那套实现的纯终端入口（不用 Qt，全程 `print`） |
 
 运行方式（权重路径按需替换）：
 
@@ -474,10 +507,16 @@ python -I src/streaming_asr.py --model-dir <权重目录> --batch-check --chunk 
 python -I src/streaming_asr.py --model-dir <权重目录> --mic
 python -I src/streaming_asr.py --model-dir <权重目录> --list-devices
 
+# ---- mini/ 那套实现（自包含，不 import src/）----
+python -I test_mic_asr_mini.py                  # 实时麦克风，纯 print，Ctrl+C 结束
+python -I test_mic_asr_mini.py --seconds 8      # 跑 8 秒自动退出
+python -I test_mic_asr_mini.py --list-devices   # 列出音频设备
+
 # ---- 冒烟测试（回归用，不需要人工看界面）----
 python -I scripts/smoke_test_spectrogram.py     # 离线链路 + 帧间隔统计
 python -I scripts/smoke_test_mic_audio.py       # 麦克风链路，假音频回放
 python -I scripts/smoke_test_mic_monitor.py     # 麦克风链路，真开麦克风
+python -I scripts/verify_mini.py                # mini/ 与 src/ 逐点对拍
 ```
 
 不指定 `--wav` 时自动跑 `<权重目录>/test_wavs/*.wav`。

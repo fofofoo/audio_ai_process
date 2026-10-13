@@ -18,10 +18,14 @@
 | 两条前端的识别结果 | **4/4 逐 token 完全相同** |
 | 流式 vs 批量（分帧层 / 特征层） | **逐位相同**（`max\|Δ\| = 0`） |
 | 流式 vs 批量（token 序列） | **4/4 完全一致** |
+| `mini/` 独立重写 vs `src/`（前端） | **逐位相同**（`max\|Δ\| = 0`） |
+| `mini/` 独立重写 vs `src/`（token 序列） | **4/4 完全一致** |
 | 离线实时率 RTF | 0.059 ~ 0.068（比实时快约 16 倍） |
+| 实时识别 RTF（`mini/` 流式链路） | ≈ 0.10（比实时快约 10 倍） |
 | 实时链路峰值负载（单次喂 encoder / 喂间隔） | **6 ~ 9%** |
 | 模型会话加载耗时 | ≈ 1.5 s |
 | 端到端运行时依赖 | `onnxruntime` + `numpy` + `soundfile` |
+| `mini/` 端到端运行时依赖 | `onnxruntime` + `numpy` + `sounddevice` |
 
 也就是说，`kaldi_native_fbank` 在本项目里只保留「数值标尺」这一个用途，
 用来证明自研前端是对的——**交付形态不依赖它**。
@@ -62,6 +66,14 @@ python realtime_mic_monitor.py
 python -I src/asr_onnx_decode.py --model-dir weight/<权重目录> --frontend ours
 ```
 
+`mini/` 那套自包含实现另有一个纯终端入口（不用 Qt，全程 `print`，权重同样自动定位）：
+
+```bash
+python -I test_mic_asr_mini.py                  # 实时麦克风，Ctrl+C 结束
+python -I test_mic_asr_mini.py --seconds 8      # 跑 8 秒自动退出
+python -I test_mic_asr_mini.py --list-devices   # 列出音频设备
+```
+
 ---
 
 ## 项目结构
@@ -70,13 +82,18 @@ python -I src/asr_onnx_decode.py --model-dir weight/<权重目录> --frontend ou
 audio_ai_process/
 ├── test_spectrogram.py        ← 入口①：离线样本回放 + 三块图 + 流式识别
 ├── realtime_mic_monitor.py    ← 入口②：实时麦克风 + 三块图 + 流式识别
-├── src/                       ← 核心库
+├── test_mic_asr_mini.py       ← 入口③：mini 版实时麦克风（无界面，纯 print）
+├── src/                       ← 核心库（生产形态）
 │   ├── traditional_features.py   自研前端（对齐 kaldi 口径）
 │   ├── streaming_features.py     增量分帧 + 增量 LogFBank
 │   ├── asr_onnx_decode.py        onnxruntime 解码（贪心搜索 + 文本还原）
 │   ├── streaming_asr.py          增量解码 + 麦克风采集
 │   ├── live_audio_view.py        三块实时可视化控件
 │   └── console_utf8.py           控制台 UTF-8（Windows 默认 GBK）
+├── mini/                      ← 另一套自包含的流式实现（学习 / C++ 移植用，不 import src/）
+│   ├── audio_preprocess.py       波形块 → LogFBank 特征
+│   ├── asr_decode.py             特征 → 文本（贪心搜索）
+│   └── mic_client.py             回调采集 + get_last_audio()
 ├── scripts/                   ← 验证与冒烟测试脚本（不需要人工看界面）
 ├── data/                      ← aishell1 子集（train/test CSV + wav），离线样本来源
 ├── doc/                       ← 调研报告与工作流报告
@@ -85,14 +102,17 @@ audio_ai_process/
 ```
 
 `scripts/` 与 `sharpa-onnx/` 都不是运行必需：前者是开发期的验证工具，
-后者是从上游 clone 下来对照阅读 C++ 实现的源码副本。
+后者是从上游 clone 下来对照阅读 C++ 实现的源码副本。`mini/` 则是与 `src/` 平行的
+另一套自包含实现（见下方专节），两者互不引用——`mini/` 不 import `src/`，`src/` 也不知道
+`mini/` 的存在。
 
 ---
 
-## 两个入口脚本
+## 两个 GUI 入口脚本
 
 两个脚本共用 `src/` 里的同一套核心库——识别类、绘图控件、权重定位都只有一份实现，
-改一处两边同时生效。
+改一处两边同时生效。（另有第三条入口 `test_mic_asr_mini.py`，属于 `mini/` 那套独立实现，
+见下方专节。）
 
 ### `test_spectrogram.py` — 离线样本回放
 
@@ -238,6 +258,50 @@ while start + T < n_feat_frames:            # T = 61
 
 ---
 
+## `mini/`：给学习和 C++ 移植的另一套
+
+`src/` 是为**生产可用**写的：分层抽象、跨模块复用、GUI 后台线程。它跑得对，但读者要在
+多个文件间来回跳，才能拼出「一帧音频到一段文字」的完整路径。`mini/` 是同一件事的另一种
+写法，唯一的优化目标是**能逐行对照移植**：
+
+- **完全自包含**，不 `import src/` 任何模块；三个类之间零耦合，正好对应 C++ 的三个编译单元。
+- **前端与推理都写成显式逐帧循环**（去直流 → 逐帧倒序预加重 → 加窗 → FFT → 功率谱 →
+  Mel 滤波 → log），能看见裸循环，没有大矩阵批量。
+- **不用 Qt、不起 Python 线程、不引入 scipy**（窗函数手算）。麦克风靠 PortAudio 回调线程
+  采集，主循环用 `get_last_audio()` 主动拉取。
+- 注释按最密写：解释不变量（为什么预加重必须倒序、为什么补的 0 不是静音），而不是复述语法。
+
+```
+mini/audio_preprocess.py   AudioPreprocess   波形块 → LogFBank 特征
+mini/asr_decode.py         AsrDecoder        特征 → 文本（贪心搜索）
+mini/mic_client.py         MicClient         回调采集 + get_last_audio()
+```
+
+有一条与 GUI 那条线**刻意不同**的取舍：`get_last_audio()` 取走的是自上次调用以来累积的
+**全部**样本，而 `src/streaming_asr.py` 在队列满时丢**最旧**的块。前者要的是波形连续无损
+（慢一点只是延迟变大），后者要的是画面低延迟。只保留「最新一块」会让两次拉取之间的
+30 ms 语音出现断口，去直流和预加重会把断口当突变，Mel 谱错乱、吞字。
+
+因为它是**独立重写**的，还顺带成了第三把数值标尺——`scripts/verify_mini.py` 把它与 `src/`
+逐点对拍，两边算的是同一件事，一致就说明两份实现都没写错：
+
+| 对拍项 | 覆盖范围 | 结果 |
+|---|---|---|
+| 前端 vs `frontend_for_onnx` | 4 段真实音频 × 块长 160/257/400/1000/一次全喂；短信号 n = 0/60/79/80/120/139/140/141/280/281（含 `edge` 退化分支） | **逐位相同**，`max\|Δ\| = 0` |
+| 解码 token 序列 vs 批量解码 | 4 段音频 × 每次喂 1/7/37 帧/一次全喂 | **完全一致**，`n_chunks` 与 `n_enc_frames` 也逐项相同 |
+| 实时麦克风 | RTF ≈ 0.10 | 识别正确，丢块 0 |
+
+前端能逐位相同，是因为两边唯一的差异只有求和次序（`power @ filters.T` 走 BLAS vs 显式稀疏
+累加）和 `np.abs(z)**2` vs `real² + imag²`——在 float64 下这些差异确实是 0。
+
+```bash
+python -I scripts/verify_mini.py --part a    # 只跑前端对拍（快，不加载模型）
+python -I scripts/verify_mini.py --part b    # 只跑解码对拍（要加载 onnx）
+python -I scripts/verify_mini.py             # 全跑
+```
+
+---
+
 ## 验证
 
 所有验证都不需要人工看界面，脚本在 `scripts/` 下：
@@ -246,6 +310,7 @@ while start + T < n_feat_frames:            # T = 61
 python -I scripts/smoke_test_spectrogram.py     # 离线链路：offscreen 跑完整播放+识别，统计帧间隔
 python -I scripts/smoke_test_mic_audio.py       # 麦克风链路：假 InputStream 按 1× 速度回放真实 wav
 python -I scripts/smoke_test_mic_monitor.py     # 麦克风链路：真开麦克风跑 N 秒自动退出
+python -I scripts/verify_mini.py                # mini/ 与 src/ 逐点对拍（前端 + token 序列）
 ```
 
 其中 `smoke_test_mic_audio.py` 只替换最外层的 PortAudio 那一层，
