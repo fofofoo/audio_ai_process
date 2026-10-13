@@ -1,6 +1,6 @@
 # sherpa-onnx ASR 预处理及后处理工作流报告
 
-> 项目：ASR-jetson
+> 项目：audio_ai_process
 > 模型：`sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05`
 > 日期：2026-10-13
 > 前置文档：[sherpa-onnx-ASR部署调研报告.md](sherpa-onnx-ASR部署调研报告.md)（调用路径与可行性调研）

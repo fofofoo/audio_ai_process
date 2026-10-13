@@ -1,4 +1,4 @@
-# ASR-jetson
+# audio_ai_process
 
 中文流式语音识别（streaming zipformer2 transducer）的**纯 Python 复现**。
 
@@ -67,7 +67,7 @@ python -I src/asr_onnx_decode.py --model-dir weight/<权重目录> --frontend ou
 ## 项目结构
 
 ```
-ASR-jetson/
+audio_ai_process/
 ├── test_spectrogram.py        ← 入口①：离线样本回放 + 三块图 + 流式识别
 ├── realtime_mic_monitor.py    ← 入口②：实时麦克风 + 三块图 + 流式识别
 ├── src/                       ← 核心库

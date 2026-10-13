@@ -95,4 +95,3 @@ PortAudio 回调线程 ──audio_q(Queue)──> Qt 主线程 ──worker.fee
 - `dither` 语义与 `kaldi_native_fbank` 的默认值口径不同（本项目是高斯噪声标准差，直接作用于输入量纲）；推理一律用 0，流式版直接拒绝非 0。
 - `sounddevice` 的设备编号与 `query_devices()` 打印的表对不上，默认路径不受影响。
 - 待办：对 `data/` 的aishell1 子集批量解码、与标注比 WER，出准确率与 RTF 基线；可选加 VAD/端点检测。
-- `.vscode/settings.json` 里的 `cmake.sourceDirectory` 仍指向旧路径 `C:/Users/Liyun/Desktop/ASR-jetson/sharpa-onnx`，与本仓库目录不符，仅影响 C++ 插件的 IntelliSense。
