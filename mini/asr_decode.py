@@ -55,18 +55,18 @@ decoder 前向。写出"每帧都刷新"不会报错，只是白白慢好几倍�
 不需要额外处理。补的 0 是 log 域对应能量 1 的 0，不是静音 —— 目的是让最后
 不满一个 chunk 的尾段也能凑齐、被解码到，否则尾字会丢。
 
-依赖：只用 numpy + onnxruntime。
+依赖：只用 numpy —— 三个 onnx 会话由调用方（入口脚本）建好传进来，
+本模块既不定位权重文件、也不碰 onnxruntime。
 """
 
 import os
 import re
 
 import numpy as np
-import onnxruntime as ort
 
 
 # ============================================================
-# 一、词表与权重定位（模块级小工具）
+# 一、词表与文本还原（模块级小工具）
 # ============================================================
 def load_tokens(path):
     """读 tokens.txt，返回 {id: token}。
@@ -126,25 +126,18 @@ def detokenize(tokens):
     return text.strip()
 
 
-def find_onnx(model_dir, stem):
-    """在权重目录里定位一个 onnx 文件：优先 int8，再退回 fp32。"""
-    for name in ("%s.int8.onnx" % stem, "%s.onnx" % stem):
-        p = os.path.join(model_dir, name)
-        if os.path.isfile(p):
-            return p
-    raise FileNotFoundError("在 %s 下找不到 %s.int8.onnx 或 %s.onnx"
-                            % (model_dir, stem, stem))
-
-
 # ============================================================
 # 二、解码器
 # ============================================================
 class AsrDecoder:
     """三段 onnx 会话 + 流式贪心搜索。
 
+    三个 session 由调用方建好传进来（见入口 test_mic_asr_mini.py）——
+    本类只管「怎么用模型」，不管「模型从哪来、跑在哪块硬件上」。
+
     用法::
 
-        dec = AsrDecoder("weight/xxx-2026-06-05")
+        dec = AsrDecoder(enc_sess, dec_sess, joi_sess, "weight/xxx/tokens.txt")
         while 还有特征:
             text = dec.accept_features(feats)   # 喂一块 (n, 80)，返回当前完整文本
 
@@ -157,35 +150,28 @@ class AsrDecoder:
                "tensor(int64)": np.int64,
                "tensor(int32)": np.int32}
 
-    def __init__(self, model_dir, sample_rate=16000):
+    def __init__(self, encoder, decoder, joiner, tokens_path, sample_rate=16000):
         """
         参数:
-            model_dir   —— 权重目录，内含 encoder/decoder/joiner 三个 onnx
-                           与 tokens.txt
+            encoder / decoder / joiner
+                        —— 三个已建好的 onnxruntime.InferenceSession，
+                           顺序对应 zipformer2 transducer 的三段
+            tokens_path —— tokens.txt 的路径
             sample_rate —— 采样率，目前只用于记录（模型固定 16kHz）
         """
-        model_dir = os.path.abspath(model_dir)
-        tok_path = os.path.join(model_dir, "tokens.txt")
-        if not os.path.isfile(tok_path):
-            raise FileNotFoundError("找不到词表：%s" % tok_path)
-        self.model_dir = model_dir
+        self.encoder = encoder
+        self.decoder = decoder
+        self.joiner = joiner
+
+        self.tokens_path = os.path.abspath(tokens_path)
+        if not os.path.isfile(self.tokens_path):
+            raise FileNotFoundError("找不到词表：%s" % self.tokens_path)
         self.sample_rate = int(sample_rate)
 
-        # ---- 三个会话 ----
-        # 单线程 + 静音日志：这是实时语音场景，多个 chunk 之间本来就串行，
-        # 让 onnxruntime 再开线程池只会增加调度开销。
-        so = ort.SessionOptions()
-        so.inter_op_num_threads = 1
-        so.intra_op_num_threads = 1
-        so.log_severity_level = 3
-
-        def _sess(path):
-            return ort.InferenceSession(path, so,
-                                        providers=["CPUExecutionProvider"])
-
-        self.encoder = _sess(find_onnx(model_dir, "encoder"))
-        self.decoder = _sess(find_onnx(model_dir, "decoder"))
-        self.joiner = _sess(find_onnx(model_dir, "joiner"))
+        # 实际生效的执行器：用哪些 provider 是调用方的决定，这里如实记下来
+        # 供打印 —— CUDA 不可用时 onnxruntime 会自己退回 CPU，以 session
+        # 上报的为准，别拿入口那行期望值当结果。
+        self.providers = encoder.get_providers()
 
         # ---- 从 metadata 读尺寸，不硬编码 ----
         meta = self.encoder.get_modelmeta().custom_metadata_map
@@ -225,7 +211,7 @@ class AsrDecoder:
             self._state_proto.append((shape, self._DTYPES[n.type]))
 
         # ---- 词表 ----
-        self.id2token = load_tokens(tok_path)
+        self.id2token = load_tokens(self.tokens_path)
         self.blank_id = find_blank(self.id2token)
 
         self.reset()
@@ -261,7 +247,7 @@ class AsrDecoder:
                 "context_size": self.context_size,
                 "vocab_size": self.vocab_size,
                 "n_states": len(self.states), "blank_id": self.blank_id,
-                "n_mels": self.n_mels}
+                "n_mels": self.n_mels, "providers": self.providers}
 
     # --------------------------------------------------------
     # 三个 session：C++ 侧逐个对应的低层接口

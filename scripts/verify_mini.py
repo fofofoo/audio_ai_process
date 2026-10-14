@@ -221,7 +221,22 @@ def part_b(wavs, model_dir, frame_chunks):
 
     print("正在加载 mini 的 AsrDecoder ...")
     t0 = time.time()
-    mini_model = AsrDecoder(model_dir)
+    # mini 的 AsrDecoder 现在只接收现成的 session（权重定位与执行器选择都
+    # 归入口脚本管），所以这里自己把三个建好。固定走 CPU：src 侧就是 CPU，
+    # 两边同条件才对拍得公平。
+    import onnxruntime as ort
+    _so = ort.SessionOptions()
+    _so.inter_op_num_threads = 1
+    _so.intra_op_num_threads = 1
+    _so.log_severity_level = 3
+
+    def _mini_sess(stem):
+        return ort.InferenceSession(find_onnx(model_dir, stem), _so,
+                                    providers=["CPUExecutionProvider"])
+
+    mini_model = AsrDecoder(_mini_sess("encoder"), _mini_sess("decoder"),
+                            _mini_sess("joiner"),
+                            os.path.join(model_dir, "tokens.txt"))
     info = mini_model.info()
     print("  就绪 %.2fs  %s" % (time.time() - t0, info))
 
