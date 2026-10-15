@@ -7,6 +7,7 @@
 
 模型：`sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05`
 （int8 量化，中英混合，自带标点）
+git archive --format=zip --prefix=audio_ai_process/ -o audio_ai_process_2026-10-14.zip HEAD
 
 ---
 
@@ -66,13 +67,14 @@ python realtime_mic_monitor.py
 python -I src/asr_onnx_decode.py --model-dir weight/<权重目录> --frontend ours
 ```
 
-`mini/` 那套自包含实现另有一个纯终端入口（不用 Qt，全程 `print`，权重同样自动定位）：
+`mini/` 那套自包含实现另有一个纯终端入口（不用 Qt，全程 `print`）：
 
 ```bash
 python -I test_mic_asr_mini.py                  # 实时麦克风，Ctrl+C 结束
-python -I test_mic_asr_mini.py --seconds 8      # 跑 8 秒自动退出
-python -I test_mic_asr_mini.py --list-devices   # 列出音频设备
 ```
+
+不收命令行参数：三个 onnx 与词表的路径、执行器顺序、麦克风设备都硬编码在文件顶部；
+想看设备列表，把入口第 1 节里 `list_devices()` 那一行的注释取消即可。
 
 ---
 
