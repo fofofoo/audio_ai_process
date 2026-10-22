@@ -1,57 +1,7 @@
 # -*- coding: utf-8 -*-
 """麦克风采集：输出裸音频流（mini 版第三条流水线）。
-
-============================================================
-这份代码是干什么的
-============================================================
 打开声卡，把麦克风的音频一块一块收进缓冲，等主循环主动来取。
-
-    PortAudio 采集线程 ──callback()──> deque 缓冲 ──get_last_audio()──> 主循环
-
-我们**不自己创建任何 Python 线程**。回调函数由 PortAudio 内部线程调用，
-它只做一件微小的事：把这一块样本复制一份塞进缓冲，然后立刻返回。
-真正的识别、打印都在主循环里做。
-
-============================================================
-一、回调里为什么必须 .copy()
-============================================================
-sounddevice 传给回调的 indata 是一块**会被复用**的底层缓冲 —— 回调返回后，
-PortAudio 就会拿同一块内存装下一批音频。不 copy 直接存引用的话，主循环
-读到的可能是已经被覆盖的脏数据，表现为偶发的、无法复现的识别错误。
-
-所以回调里必须 `indata[:, 0].copy()`，并且除这次拷贝外不做任何别的事
-（不碰模型、不打印、不加锁）。
-
-============================================================
-二、get_last_audio() 的语义：取走全部，不是只留最新一块
-============================================================
-主循环在两次拉取之间，可能被一次 encoder 前向（约 40ms）卡住，而这期间
-声卡已经送来 3~4 块（每块 10ms）。
-
-如果只保留"最新一块"，中间那 30ms 语音就被静默丢掉了 —— 波形出现断口，
-去直流和预加重会把断口当成突变，Mel 谱乱掉，结果是吞字或识别成乱码。
-
-所以这里取走的是**自上次调用以来累积的全部样本**，波形连续无损。慢一点
-只是延迟变大，识别结果仍然完整。
-
-（对照：生产版 src/streaming_asr.py 用的是"丢最旧块"，那是为了 GUI 画面的
-低延迟；mini 版要的是正确性，所以选择不丢。）
-
-============================================================
-三、线程安全：为什么不加锁
-============================================================
-生产者（回调线程）只往 deque 右端 append，消费者（主循环）只从 deque 左端
-popleft。在 CPython 里，deque 的 append 和 popleft 各自是一个原子的 C 操作，
-不会读到半截状态；一右一左，两边也不会互相干扰。所以不需要加锁。
-
-**尤其不能在回调里加锁**：回调属于 PortAudio 的实时线程，一旦它卡在锁上，
-声卡缓冲就会溢出，表现是丢块和爆音。
-
-deque 设了 maxlen 作内存上界。万一主循环长时间跟不上，缓冲满了会自动淘汰
-最旧的块，dropped 计数会涨 —— 这个数字可观测，方便判断是不是该调大 block
-或降低负载了。
-
-依赖：只用 numpy + sounddevice。
+    PortAudio 采集线程 ──callback()──> deque 缓冲 ── get_last_audio()拼接一维波形 ──> 主循环获取最近的音频数据（长度不固定）
 """
 
 import collections
@@ -62,7 +12,6 @@ import sounddevice as sd
 
 class MicClient:
     """麦克风裸流客户端。
-
     用法::
 
         mic = MicClient()
@@ -75,15 +24,14 @@ class MicClient:
         mic.stop()
     """
 
-    def __init__(self, sample_rate=16000, channels=1, block=160,
-                 device=None, max_blocks=256):
+    def __init__(self, sample_rate=16000, channels=1, block=160, device=None, max_blocks=256):
         """
         参数:
             sample_rate —— 采样率（Hz），模型要求 16000
             channels    —— 采集声道数，1 = 单声道
-            block       —— 每次回调交付的样本数。160 = 10ms @16kHz
+            block       —— 每次回调交付的样本数。160 = 10ms @16kHz = 16000 Hz * 0.01 s = 160
             device      —— 设备编号或名字；None = 系统默认输入设备
-            max_blocks  —— 缓冲最多存几块；满了淘汰最旧的（约 2.56s @256 块）
+            max_blocks  —— 缓冲最多存几块；满了淘汰最旧的（约 2.56s @256 块），一块block有160个样本
         """
         self.sample_rate = int(sample_rate)
         self.channels = int(channels)
@@ -91,15 +39,19 @@ class MicClient:
         self.device = device
         self.max_blocks = int(max_blocks)
 
-        # 采集线程写右端、主循环读左端，无需加锁（见模块 docstring 第三节）
-        self._q = collections.deque(maxlen=self.max_blocks)
-        self._stream = None
-        self._dropped = 0
-        self._peak = 0.0
-        self._n_samples = 0
+        # 采集线程写右端、主循环读左端，无需加锁
+        # deque 是 collections 里的双端队列，支持从两端以 O(1) 增删：append / appendleft / pop / popleft，maxlen 满时 append 淘汰最左
+        self._block_buf = collections.deque(maxlen=self.max_blocks)
+        self._stream = None      # PortAudio 输入流句柄；start() 之后才有值
+        self._dropped = 0        # 因缓冲满被淘汰的块数
+        self._peak = 0.0         # 至今为止的最大样本幅度
+        self._n_samples = 0      # 已被取走的累计样本数
 
     # ========================================================
     # 采集线程：唯一的入口就是这个回调，只做 copy + 入队
+    # sd.InputStream 的触发方式：start() 之后，PortAudio 自己的实时采集
+    # 线程每攒够 block 个样本（160 帧 = 10 ms @16 kHz）就调用一次，
+    # 一直循环到 stop()/close()。不是本类起的 Python 线程，主线程不参与。
     # ========================================================
     def _callback(self, indata, frames, time_info, status):
         if status:
@@ -107,24 +59,31 @@ class MicClient:
             print("[音频状态] %s" % status)
 
         # 必须 copy：indata 的底层缓冲会被 PortAudio 立刻复用
+        # indata 形状是 (frames, channels) = (160, 1)，160 帧即 10 ms
         blk = indata[:, 0].copy()
 
         # deque 满了的话，接下来这次 append 会淘汰最旧的块 —— 记账一下
-        if len(self._q) == self._q.maxlen:
+        if len(self._block_buf) == self._block_buf.maxlen:
             self._dropped += 1
 
-        self._q.append(blk)
+        # 把一帧音频写入缓存
+        self._block_buf.append(blk)
 
-        # 峰值幅度：只看不写临界，偶尔的竞争无伤大雅，就不加锁了
-        p = float(np.abs(blk).max())
-        if p > self._peak:
-            self._peak = p
+        # 一帧内的峰值幅度：只看不写临界，偶尔的竞争无伤大雅，就不加锁了
+        blk_max = float(np.abs(blk).max())
+        if blk_max > self._peak:
+            self._peak = blk_max
 
     # ========================================================
     # 对外接口
     # ========================================================
     def start(self):
         """打开麦克风，采集线程开始往里送数据。"""
+        # 初始化 sounddevice 输入流：从 device 设备按 sample_rate、channels
+        # 采集音频，每满 block 个样本（160 帧 = 10 ms）回调一次 _callback。
+        # dtype 固定 float32（范围约 [-1, 1]），与模型输入口径一致；
+        # device=None 表示系统默认输入设备。
+        # 这里只是构造，start() 之后 PortAudio 才真正开始采集和回调。
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
@@ -132,24 +91,35 @@ class MicClient:
             blocksize=self.block,
             device=self.device,
             callback=self._callback)
+
+        # 开始采集和回调音频数据
         self._stream.start()
 
+    # 返回最近积累的全部一维音频波形数据
     def get_last_audio(self):
-        """取走自上次调用以来累积的全部样本。
+        """取走自上次调用以来累积的全部样本，并将其拼接成连续的一维波形输出。
 
         返回:
             一维 float32 波形；缓冲为空时返回 None
         """
+        # 1. 收集本次取出的所有音频块
         chunks = []
+        # 2. 从队头逐块取出，直到队列为空；空队列 popleft 会抛 IndexError
         while True:
             try:
-                chunks.append(self._q.popleft())
+                chunks.append(self._block_buf.popleft())
             except IndexError:
                 break
+        # 3. 一块都没有：自上次调用以来还没有新数据
         if not chunks:
             return None
+        # 4. 记账：累计已被取走的样本数
         self._n_samples += sum(c.size for c in chunks)
-        return chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+        # 5. 只有一块时直接返回原数组，省掉一次 concatenate 拷贝；
+        #    多块时拼成一个连续的一维数组再返回，保证波形连续不丢样本
+        if len(chunks) == 1:
+            return chunks[0]
+        return np.concatenate(chunks)
 
     def stop(self):
         """关闭麦克风。之后仍可调 get_last_audio() 取走残余样本。"""

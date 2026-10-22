@@ -23,8 +23,8 @@
     1) 连接麦克风          mic.start()
     2) 建三个 onnx session build_ort_sessions()（路径写在文件顶部）
        装配解码器          AsrDecoder(encoder, decoder, joiner, tokens_path)
-    3) 预处理              front.accept_waveform(samples)
-    4) 模型推理 + 5) 后处理 dec.accept_features(feats)
+    3) 预处理              preprocessor.accept_waveform(samples)
+    4) 模型推理 + 5) 后处理 asr_decoder.accept_features(feats)
     6) 打印结果            stdout 原地刷新
 
 结束（Ctrl+C）后还要走一次收尾：补完尾部帧、并在特征尾部补 100 帧 0，
@@ -114,8 +114,12 @@ def main():
     # ========================================================
     # list_devices()        # 想看本机有哪些设备，把这一行取消注释
     device = normalize_device(MIC_DEVICE)
-    # 初始化麦克风客户端
-    mic = MicClient(sample_rate=16000, device=device)
+    # 初始化麦克风客户端：
+    # 请求 sample_rate = 16kHz 单声道，PortAudio 以 16k 打开device的流，声卡原生不支持时由 PortAudio 内部重采样。
+    # 不用管客户端内部块大小与回调节奏，默认每块 160 样本(10ms)回调一次，最多缓存 256 块(≈2.56s，满了淘汰最旧块)。
+    # 主循环只需定期调 get_last_audio()，返回自上次调用以来累积所有缓存块拼成的一维 float32 波形(长度不固定，无新数据为 None)，
+    mic = MicClient(sample_rate = 16000, device = device)
+   
    
     # ========================================================
     #  2.加载三个onnx模型，初始化预处理和推理实例
@@ -127,16 +131,16 @@ def main():
     JOINER_ONNX = os.path.join(_ASR_DIR, "joiner.int8.onnx")
     TOKENS_TXT = os.path.join(_ASR_DIR, "tokens.txt")
     # 2.1 加载onnx模型，返回三个session
-    enc, dec_sess, joi = build_ort_sessions(ENCODER_ONNX, DECODER_ONNX, JOINER_ONNX)
+    encoder_session, decoder_session, joiner_session = build_ort_sessions(ENCODER_ONNX, DECODER_ONNX, JOINER_ONNX)
     # 2.2 初始化asr推理器，组合三个session和词表的语言转文字工作流水线
-    dec = AsrDecoder(enc, dec_sess, joi, TOKENS_TXT)
-    # 2.3 初始化预处理类，将音频转换为特征，输入asr模型，n_mels 跟着模型走，避免两边维度对不上
-    front = AudioPreprocess(sample_rate=16000, n_mels=dec.n_mels)
+    asr_decoder = AsrDecoder(encoder_session, decoder_session, joiner_session, TOKENS_TXT)
+    # 2.3 初始化预处理类，将音频转换为LogFBank特征，输入asr模型，n_mels 跟着模型走，避免两边维度对不上
+    preprocessor = AudioPreprocess(sample_rate=16000, n_mels=asr_decoder.n_mels)
 
     # ========================================================
     # 3.打印模型信息、预处理参数、麦克风参数
     # ========================================================  
-    info = dec.info()
+    info = asr_decoder.info()
     print("=" * 74)
     print("mini 流式 ASR —— 预处理 / 解码 / 麦克风 三条流水线")
     print("=" * 74)
@@ -147,8 +151,8 @@ def main():
     print("模型  : T=%d(输入帧数)  decode_chunk_len=%d(每轮前移)  ""context_size=%d  vocab=%d  状态张量=%d"
           % (info["T"], info["decode_chunk_len"], info["context_size"], info["vocab_size"], info["n_states"]))
     print("预处理端  : %d Hz  帧长 %d 点(%.0fms)  帧移 %d 点(%.0fms)  n_mels=%d"
-          % (front.sample_rate, front.frame_size, front.frame_size / front.sample_rate * 1e3,  front.frame_step, front.frame_step / front.sample_rate * 1e3,  front.n_mels))
-    print("词表  : %d 个  blank_id=%d (%s)"% (len(dec.id2token), dec.blank_id, dec.id2token.get(dec.blank_id, "?")))
+          % (preprocessor.sample_rate, preprocessor.frame_size, preprocessor.frame_size / preprocessor.sample_rate * 1e3,  preprocessor.frame_step, preprocessor.frame_step / preprocessor.sample_rate * 1e3,  preprocessor.n_mels))
+    print("词表  : %d 个  blank_id=%d (%s)"% (len(asr_decoder.id2token), asr_decoder.blank_id, asr_decoder.id2token.get(asr_decoder.blank_id, "?")))
     print()
 
     # ========================================================
@@ -171,9 +175,9 @@ def main():
                 time.sleep(0.002)      # 还没攒到新数据，让出 CPU 别空转
                 continue
             # 4.2 预处理
-            feats = front.accept_waveform(samples)   
+            feats = preprocessor.accept_waveform(samples)   
             # 4.3 推理 + 后处理
-            text = dec.accept_features(feats)       
+            text = asr_decoder.accept_features(feats)       
             # 4.4 打印：只在变化时刷新
             if text != shown:                        
                 shown = text
@@ -192,16 +196,16 @@ def main():
     #     chunk 的尾段也能被解码 —— 少了这一步，最后几个字会被整段丢掉
     leftover = mic.get_last_audio()
     if leftover is not None:
-        dec.accept_features(front.accept_waveform(leftover))
-    text = dec.accept_features(front.input_finished())
+        asr_decoder.accept_features(preprocessor.accept_waveform(leftover))
+    text = asr_decoder.accept_features(preprocessor.input_finished())
     # 5.3 正常退出，统计结果
     dur = time.perf_counter() - t_start
     print("\n")
     print("=" * 74)
     print("识别结果：%s" % text)
     print("=" * 74)
-    print("时长 %.1fs   喂入样本 %d   产出帧 %d" % (dur, front.n_samples, front.n_frames))
-    print("encoder 调用 %d 次 / 共 %d 帧   token %d 个"% (dec.n_chunks, dec.n_enc_frames, len(dec.token_ids)))
+    print("时长 %.1fs   喂入样本 %d   产出帧 %d" % (dur, preprocessor.n_samples, preprocessor.n_frames))
+    print("encoder 调用 %d 次 / 共 %d 帧   token %d 个"% (asr_decoder.n_chunks, asr_decoder.n_enc_frames, len(asr_decoder.token_ids)))
     print("丢块 %d   峰值幅度 %.3e" % (mic.dropped, mic.peak))
     # 5.4 try异常退出提示
     if mic.dropped:

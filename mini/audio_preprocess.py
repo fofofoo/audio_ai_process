@@ -16,15 +16,15 @@
 ============================================================
 一、分帧：kaldi 的 FirstSampleOfFrame 语义
 ============================================================
-帧长 W = 400 个样本（25ms @16kHz），帧移 S = 160 个样本（10ms）。
+帧长 Frame_len = 400 个样本（25ms @16kHz），帧移 Frame_step_len = 160 个样本（10ms）。
 第 m 帧覆盖的样本区间是
 
-    lo = m·S + S//2 − W//2 = 160m − 120
-    hi = lo + W            = 160m + 280
+    lo = m·Frame_step_len + Frame_step_len//2 − Frame_len//2 = 160m − 120
+    hi = lo + Frame_len    = 160m + 280
 
 注意 lo 可以是**负数**（第 0 帧就是 −120），hi 也可能越过已到达的样本数。
 kaldi 的规矩是：越界的部分用**镜像反射**补出来，而不是丢帧或补零。
-这就是本项目默认 snip_edges=False 的含义 —— 帧中心严格钉在 t·S 上，
+这就是本项目默认 snip_edges=False 的含义 —— 帧中心严格钉在 t·Frame_step_len 上，
 每 10ms 必出一帧，两端缺的靠镜像补齐。
 
 左补齐量恒为 120，且**只有第 0 帧**用得到：m=1 时 lo 已经是 40 > 0。
@@ -51,7 +51,7 @@ numpy 的镜像补齐（symmetric）要求补齐宽度小于原数组长度，�
 四、七项必须对齐的 kaldi 口径（写错任何一项都会静默产生偏差）
 ============================================================
     1. snip_edges=False 的分帧语义（见上）
-    2. povey 窗，且**分母是 W−1，不是 W**
+    2. povey 窗，且**分母是 Frame_len−1，不是 Frame_len**
     3. 窗函数手算，不用 scipy（scipy 默认 periodic 约定与 kaldi 不同）
     4. **逐帧**预加重（不是对整段波形做），且帧内必须**倒序**执行
     5. Mel 滤波器组要遍历**整数 FFT bin**、在 **Mel 域**插值
@@ -86,7 +86,7 @@ class AudioPreprocess:
             feats = front.accept_waveform(chunk)   # (n_new, 80) float32，可能 0 帧
         feats = front.input_finished()             # 收尾：补完尾帧 + 尾部补 0
 
-    单帧的因果延迟 = W//2 = 200 个样本 = 12.5ms：第 m 帧要等样本攒到
+    单帧的因果延迟 = Frame_len//2 = 200 个样本 = 12.5ms：第 m 帧要等样本攒到
     160m+280 才能算出来，而它的中心在 160m+80。
     """
 
@@ -106,15 +106,12 @@ class AudioPreprocess:
             n_mels          —— Mel 滤波器个数，即输出特征维度
             frame_len_ms    —— 帧长（毫秒），25ms 是语音的经典取值
             frame_shift_ms  —— 帧移（毫秒），10ms 保证时间轴平滑连续
-            n_fft           —— FFT 点数，取 >= 帧长的 2 的幂（512 @16kHz -> 257 bin）
+            n_fft           —— FFT 点数，取 >= 与帧长（400）接近的 2 的幂（512 @16kHz -> 257 bin）
             preemph         —— 预加重系数，通常 0.95 ~ 0.97
             low_freq        —— Mel 滤波器组下限（Hz），kaldi 默认 20
             high_freq       —— Mel 滤波器组上限；0 = Nyquist，负数 = Nyquist + 该值。
-                               kaldi C++ 的默认是 -400（即 7600Hz），本模块跟
-                               官方 test_onnx.py 取 0（Nyquist = 8000Hz）。
-                               这个口径分歧**尚未实测**，需要时可改。
-            tail_pad_frames —— input_finished() 时在尾部补几帧 0（特征域 0，
-                               不是静音），默认 100 帧 ≈ 1 秒，与官方一致
+                               kaldi C++ 的默认是 -400（即 7600Hz），本模块跟sharpe官方 test_onnx.py 取 0（Nyquist = 8000Hz）。
+            tail_pad_frames —— input_finished() 时在尾部补几帧 0（特征域 0， 不是静音），默认 100 帧 ≈ 1 秒，与官方一致
         """
         self.sample_rate = int(sample_rate)
         self.n_mels = int(n_mels)
@@ -125,12 +122,14 @@ class AudioPreprocess:
         self.tail_pad_frames = int(tail_pad_frames)
 
         # kaldi FrameExtractionOptions::WindowSize() 是**截断**而不是四舍五入
-        self.frame_size = int(self.sample_rate * 0.001 * frame_len_ms)     # W = 400
-        self.frame_step = int(self.sample_rate * 0.001 * frame_shift_ms)   # S = 160
+        self.frame_size = int(self.sample_rate * 0.001 * frame_len_ms)     # Frame_len = 400
+        self.frame_step = int(self.sample_rate * 0.001 * frame_shift_ms)   # Frame_step_len = 160
         self.n_freq = self.n_fft // 2 + 1                                  # 257 个正频率 bin
 
-        # 第 m 帧的起点 = m·S + first；first 对 S=160/W=400 就是 -120
+        
+        # 第 m 帧的起点 = m·Frame_step_len + first；first 对 Frame_step_len=160/Frame_len=400 就是 -120
         self.first = self.frame_step // 2 - self.frame_size // 2
+
         # 左补齐量（恒为 120，只有第 0 帧用得到），_pad_mode 判据里要用
         self.left_pad = self.frame_size // 2 - self.frame_step // 2
 
@@ -204,7 +203,7 @@ class AudioPreprocess:
         if self._done:
             return np.zeros((0, self.n_mels), dtype=np.float32)
         self._done = True
-        # 样本总数此时已定，批量版的帧数公式可以用了：round(N/S)
+        # 样本总数此时已定，批量版的帧数公式可以用了：round(N/Frame_step_len)
         self._nf_total = (self._n + self.frame_step // 2) // self.frame_step
 
         out = []
@@ -238,7 +237,7 @@ class AudioPreprocess:
                 <= self._n)
 
     def _frame(self, m):
-        """取第 m 帧的 W 个原始样本，两端越界处镜像补齐。
+        """取第 m 帧的 Frame_len 个原始样本，两端越界处镜像补齐。
 
         只补这一帧自己越界的那一段。因为补出来的点只取决于贴边的那几个样本、
         且镜像长度固定，逐帧补与"整段补一次"得到的结果完全相同。
@@ -302,7 +301,7 @@ class AudioPreprocess:
     def _trim(self):
         """丢掉后面任何一帧都用不到的旧样本。
 
-        下一帧的起点是 _next·S + first，它之前的样本再也不会被读到。
+        下一帧的起点是 _next·Frame_step_len + first，它之前的样本再也不会被读到。
         用 .copy() 而不是切片：切片是视图，会让整块原始内存一直挂着不释放。
         """
         keep_from = max(0, self._next * self.frame_step + self.first)
@@ -315,13 +314,13 @@ class AudioPreprocess:
     # 帧内处理：7 步 LogFBank，显式逐帧
     # ========================================================
     def _proc_frame(self, frame):
-        """把一帧 W 个原始样本走完 7 步，得到一个 n_mels 维特征向量。
+        """把一帧 Frame_len 个原始样本走完 7 步，得到一个 n_mels 维特征向量。
 
         这个函数就是 C++ 主循环体的逐行对应物：每一步都是一次显式运算，
         没有大矩阵批量。
 
         参数:
-            frame —— 一帧原始样本 (W,)
+            frame —— 一帧原始样本 (Frame_len,)
         返回:
             LogFBank 特征 (n_mels,)，float64
         """
@@ -379,11 +378,11 @@ class AudioPreprocess:
     # 构造：窗函数与 Mel 滤波器组（各算一次，之后复用）
     # ========================================================
     def _build_window(self):
-        """povey 窗：(0.5 − 0.5·cos(2πn/(W−1)))^0.85。
+        """povey 窗：(0.5 − 0.5·cos(2πn/(Frame_len−1)))^0.85。
 
         手算而不用 scipy.signal.get_window，原因只有一个：**分母**。
-        kaldi 的窗都用 (W−1) 作分母（首尾都取到零点），scipy 默认
-        periodic=True 用 W 作分母 —— W=400 时两者最大差 5.5e-3，
+        kaldi 的窗都用 (Frame_len−1) 作分母（首尾都取到零点），scipy 默认
+        periodic=True 用 Frame_len 作分母 —— Frame_len=400 时两者最大差 5.5e-3，
         足以把 log-mel 特征拉开可见的差距。
         """
         n = np.arange(self.frame_size, dtype=np.float64)
