@@ -241,8 +241,8 @@ def part_b(wavs, model_dir, frame_chunks):
     print("  就绪 %.2fs  %s" % (time.time() - t0, info))
 
     # 两个解码器的静态配置必须一致
-    assert src_model.T == mini_model.T, "T 不一致"
-    assert src_model.decode_chunk_len == mini_model.shift, "decode_chunk_len 不一致"
+    assert src_model.T == mini_model.input_frame_num, "T 不一致"
+    assert src_model.decode_chunk_len == mini_model.T_shift, "decode_chunk_len 不一致"
     assert src_model.context_size == mini_model.context_size, "context_size 不一致"
     assert blank_id == mini_model.blank_id, "blank_id 不一致"
     print("  静态配置一致 ✓  (T / decode_chunk_len / context_size / blank_id)")

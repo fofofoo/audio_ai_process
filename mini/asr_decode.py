@@ -34,7 +34,7 @@
     · 后续将decoder根据这个选出的字继续预测下一个最可能的字，并不断向后词语接龙，这也是搜索这个概念的来源；
     · 如果joiner结果是 blank —— **什么都不做**，沿用上一次的 decoder 输出。
     · 贪心的由来，argmax是选字最快的，但模型将直接抛弃其他高概率的字，没有纠错可能了。
-    · 相比之下，束搜索就是每一步都同时保留前 K 条最可能的“词语接龙”路径，通过将新词得分累加到历史总分中，历史中错误的接龙被正确接龙替代，多次更新后各路径历史语句完全固化并被删掉，不再进入打分模型，从而在保证速度的情况避免贪心搜索的“一错到底”。
+    · 相比之下，没采用的束搜索就是每一步都同时保留前 K 条最可能的“词语接龙”路径，通过将新词得分累加到历史总分中，历史中错误的接龙被正确接龙替代，多次更新后各路径历史语句完全固化并被删掉，不再进入打分模型，从而在保证速度的情况避免贪心搜索的“一错到底”。
     · joiner输出 blank 不刷新 decoder，绝大多数帧都是 blank，只有真出新 token 才需要跑一次decoder 前向，加速模型推理过程。
 
 ============================================================
@@ -83,62 +83,69 @@ class AsrDecoder:
     def __init__(self, encoder, decoder, joiner, tokens_path, sample_rate=16000):
         """
         参数:
-            encoder / decoder / joiner
-                        —— 三个已建好的 onnxruntime.InferenceSession，
-                           顺序对应 zipformer2 transducer 的三段
+            encoder / decoder / joiner —— 三个已建好的 onnxruntime.InferenceSession，
             tokens_path —— tokens.txt 的路径
             sample_rate —— 采样率，目前只用于记录（模型固定 16kHz）
         """
+
+        # 三个模型
         self.encoder = encoder
         self.decoder = decoder
         self.joiner = joiner
-
+        # 字典词表，最后idx转文字时使用
         self.tokens_path = os.path.abspath(tokens_path)
         if not os.path.isfile(self.tokens_path):
             raise FileNotFoundError("找不到词表：%s" % self.tokens_path)
+        # 音频采样率
         self.sample_rate = int(sample_rate)
 
-        # 实际生效的执行器：用哪些 provider 是调用方的决定，这里如实记下来
-        # 供打印 —— CUDA 不可用时 onnxruntime 会自己退回 CPU，以 session
-        # 上报的为准，别拿入口那行期望值当结果。
+        # CUDA / CPU
         self.providers = encoder.get_providers()
 
-        # ---- 从 metadata 读尺寸，不硬编码 ----
+        # 直接从 encoder的onnx模型中metadata的参数读取输入张量大小，不硬编码 ----
         meta = self.encoder.get_modelmeta().custom_metadata_map
         model_type = meta.get("model_type", "")
+        # 当前使用sharpe的zipformer2框架的asr-encoder流式模型，输入参数需要一一对应才能使用
         if model_type != "zipformer2":
-            raise RuntimeError("encoder 的 model_type=%r，本解码循环只支持 "
-                               "zipformer2" % model_type)
-        self.T = int(meta["T"])                              # 输入帧数，如 61
-        self.shift = int(meta["decode_chunk_len"])           # 每轮前移，如 48
+            raise RuntimeError("encoder 的 model_type=%r，本解码循环只支持 zipformer2" % model_type)
+        # 输入帧数，如 61
+        self.input_frame_num = int(meta["T"])   
+        # 每轮前移，如 48                          
+        self.T_shift = int(meta["decode_chunk_len"])   
+        # 读取asr-encoder 第一个输入的大小， (batch, T, n_mels)
+        x_shape = self.encoder.get_inputs()[0].shape
+        last_channel_num = x_shape[-1]
+        self.n_mels = int(last_channel_num) if not isinstance(last_channel_num, str) else 80  
+        
+        # 读取asr-encoder第二类输入 状态张量(含KVCache) ----
+        # encoder保留了最近 4 个 chunk，48 帧的特征状态，由于cnn的下采样，48 帧实际对应 480ms * 4 = 1920 ms的历史数据
+        # 116个 状态向量 主要含三类：
+        # 1. 2 个全局状态，单个数值，(1, )
+        # 2. 38 个 KV Cache 状态, (hidden_dim = 256 , batch = 1, T = 48), 注意力模块总计能获取 1920 + 480 = 2.4s的语音信息。
+        # 3.1 76 个 CNN 边界状态, 19 层 × 每层 4 个，由于Zipformer架构的前馈层含CNN层，而流式架构中在边界不使用padding，而是直接使用历史数据进行因果卷积
+        # 3.2 因此，需要在输入1d 特征左侧拼接历史特征，历史特征的时间长度与卷积核在边界需要补的数据一致，(batch = 1,Channels = 256/192/.. , T = kernel_size)
+        self._state_proto = []
+        for n in self.encoder.get_inputs()[1:]:
+            if n.type not in self._DTYPES:
+                raise RuntimeError("状态张量 %s 的类型 %s 未支持" % (n.name, n.type))
+            shape = [1 if isinstance(s, str) else int(s) for s in n.shape]
+            self._state_proto.append((shape, self._DTYPES[n.type]))   
 
+        # 读取asr-decoder模型的参数
         dmeta = self.decoder.get_modelmeta().custom_metadata_map
+        # 输入token的大小
         self.context_size = int(dmeta["context_size"])
+        # Decoder 内置Embedding 字典，通过查表将idx转成对应的隐藏层向量
+        # vocab_size是内置字典的词表大小，外部的tokens.txt的词表大小和排列顺序需要与之严格对应
         self.vocab_size = int(dmeta["vocab_size"])
 
-        # ---- 缓存输入输出名字，免得解码循环里每帧都做一次模型反射查询 ----
+        # ---- 读取各onnx模型的输入输出名字 ----
         self._enc_in = [n.name for n in self.encoder.get_inputs()]
         self._enc_out = [n.name for n in self.encoder.get_outputs()]
         self._dec_in = self.decoder.get_inputs()[0]
         self._dec_out = self.decoder.get_outputs()[0].name
         self._joi_in = [n.name for n in self.joiner.get_inputs()]
         self._joi_out = self.joiner.get_outputs()[0].name
-
-        # 输入特征维度：encoder 第一个输入是 (batch, T, n_mels)
-        # 最后一维正常是具体的整数；万一是符号维度（字符串）就退回 80
-        x_shape = self.encoder.get_inputs()[0].shape
-        last = x_shape[-1]
-        self.n_mels = int(last) if not isinstance(last, str) else 80
-
-        # ---- 状态张量的原型：形状与 dtype 全部从 encoder 输入签名推 ----
-        # 签名里的字符串维度（如 'N'）按 batch=1 记 1。这样换模型不用改代码。
-        self._state_proto = []
-        for n in self.encoder.get_inputs()[1:]:
-            if n.type not in self._DTYPES:
-                raise RuntimeError("状态张量 %s 的类型 %s 未支持"
-                                   % (n.name, n.type))
-            shape = [1 if isinstance(s, str) else int(s) for s in n.shape]
-            self._state_proto.append((shape, self._DTYPES[n.type]))
 
         # ---- 词表 ----
         self.id2token = self.load_tokens(self.tokens_path)
@@ -148,7 +155,7 @@ class AsrDecoder:
 
     # --------------------------------------------------------
     def reset(self):
-        """清空全部跨块状态，回到「刚开始听」。"""
+        """清空全部跨块状态，回到「刚开始听」。""" 
         self.states = [np.zeros(shape, dtype=dt)
                        for shape, dt in self._state_proto]
         self.hyp = [self.blank_id] * self.context_size
@@ -173,7 +180,7 @@ class AsrDecoder:
 
     def info(self):
         """把关键尺寸打成一包，方便入口脚本打印。"""
-        return {"T": self.T, "decode_chunk_len": self.shift,
+        return {"T": self.input_frame_num, "decode_chunk_len": self.T_shift,
                 "context_size": self.context_size,
                 "vocab_size": self.vocab_size,
                 "n_states": len(self.states), "blank_id": self.blank_id,
@@ -188,11 +195,16 @@ class AsrDecoder:
         注意返回值是 out[0]（编码结果），out[1:] 是更新后的状态张量，
         必须原样存回去 —— 这就是流式能记住前文的全部机制。
         """
+        # feed 是 模型要求的输入，第一项是音频数据，往后106项是上一次推理保留的特征状态记忆self.states
         feed = {self._enc_in[0]: x}
+        # 上一次的特征状态记忆self.states
         for i, name in enumerate(self._enc_in[1:]):
             feed[name] = self.states[i]
+        # 输入新音频 + 旧记忆 ，输出 高级时序声学表征 + 新记忆
         out = self.encoder.run(self._enc_out, feed)
+        # 新的特征状态记忆self.states，内部流通
         self.states = out[1:]
+        # 输出 高级时序声学表征
         return out[0]
 
     def run_decoder(self, hyp):
@@ -218,40 +230,67 @@ class AsrDecoder:
         返回:
             当前识别文本（没有新 token 时与上次相同）
         """
+        # 判断输入特征是否非空（feats.shape[0] > 0）
         if feats.shape[0]:
-            self._feat_buf = (np.concatenate((self._feat_buf, feats))
-                              if self._feat_buf.shape[0] else feats)
+            # 输入特征非空，需要将其加入缓冲区
+            # 判断当前缓冲区是否已有数据
+            if self._feat_buf.shape[0]:
+                # 情况 1：缓冲区非空，需要将新特征拼接到缓冲区尾部
+                self._feat_buf = np.concatenate((self._feat_buf, feats))
+            else:
+                # 情况 2：缓冲区为空（首次输入或刚被清空）
+                self._feat_buf = feats
 
+        #  n_new 表示本段480ms音频成功转出的文字数量
         n_new = 0
-        # 判据必须是 > T（**严格大于**），不能写成 >= T。
-        # 批量版每次条件是 start + T < 总帧数，即 48k + 61 < L，等价于
-        # L - 48k > 61。写成 >= 会在帧数恰好等于 48k + 61 时多喂一轮，
-        # 尾部多吐出 token。
-        while self._feat_buf.shape[0] > self.T:
-            # 取最前面 T 帧给 encoder
-            x = np.ascontiguousarray(self._feat_buf[:self.T][None])
-            # 时间轴只前进 shift 帧，多出来的那十几帧是下一轮的重叠上下文
-            self._feat_buf = np.ascontiguousarray(self._feat_buf[self.shift:])
+        # 等待缓存帧数量大于模型要求的输入帧数量61
+        while self._feat_buf.shape[0] > self.input_frame_num:
+            # 每次从_feat_buf取最新 input_frame_num 帧给 encoder，np.ascontiguousarray将切片数据转换为内存中连续排列的数组
+            x = np.ascontiguousarray(self._feat_buf[:self.input_frame_num][None])
+            # _feat_buf 取完抛弃最老的 T_shift 帧，等待新的缓存进来，剩下的input_frame_num - T_shift 帧是前后两次输入共同的重叠帧   
+            self._feat_buf = np.ascontiguousarray(self._feat_buf[self.T_shift:])
+            # 累计推理输入+1
             self.n_chunks += 1
 
-            enc = self.run_encoder(x)          # 状态在 self.states 里累积
-            nf = enc.shape[1]                  # **运行时**取输出帧数
-            self.n_enc_frames += nf
+            # encoder 网络推理，输入新的61帧音频数据， 输出 高级时序声学表征 enc_feat, (b ,T = 48 / 4 = 12 , hidden_dim)
+            enc_feat = self.run_encoder(x)          # 状态在 self.states 里累积
+            nf = enc_feat.shape[1]                  # nf是非重叠的T_shift = 48帧，时序压缩4倍后的帧数量12
+            self.n_enc_frames += nf                 # 已经编码的帧
 
+            # 逐帧提取非重叠的音频压缩编码后的帧，输入到后续的预测网络decoder 和 联合网络joiner中
+            # 注意encoder网络是输入多帧数据，decoder和joiner都是输入单帧数据，因此要顺序逐帧输入编码后的音频特征
             for k in range(nf):
-                cur = enc[0, k:k + 1]          # encoder 的第 k 帧
+                # 逐帧提取非重叠的音频压缩编码后的帧
+                cur = enc_feat[0, k:k + 1]          # encoder 的第 k 帧
+                # 联合网络 joiner 根据 当前的声学表征帧cur 和 上一次出字时 decoder 预测的下一个字，输出音频对应的文字id
+                # .argmax()，贪心算法直接将概率最高的字作为确定的输出字符
                 tid = int(self.run_joiner(cur, self.decoder_out).argmax())
+                # 如果 joiner 的预测字不是空白，输入到decoder接龙网络中判断是否为重复字并预测下一个字(对应的特征)
                 if tid != self.blank_id:
-                    # 非 blank：接进假设，并刷新 decoder
+                    # 非 blank：接进假设hyp，并刷新 decoder
+                    # hyp 是 Hypothesis（假设）的缩写。在 ASR 解码领域，它专指“当前正在生成中的、尚未最终确认的候选 token 序列”。
+                    # 这本模型使用贪心算法，hyp已经是正式token序列了，不用再束搜索了
                     self.hyp.append(tid)
+                    # 音频成功转出的文字数量 n_new + 1
                     n_new += 1
-                    self.decoder_out = self.run_decoder(
-                        self.hyp[-self.context_size:])
-                # blank：什么都不做，沿用上一次的 decoder 输出（省算力的关键）
-
+                    # 预测网络decoder判断重复并预测下一个字
+                    self.decoder_out = self.run_decoder(self.hyp[-self.context_size:])
+                    
+        # 判断本轮输入的480ms音频，是否识别出了非 blank的token序列 self.hyp
         if n_new:
-            self._text = self.detokenize([self.id2token.get(i, "?")
-                                     for i in self.token_ids])
+            # 1. 有新字吐出，将 token id 列表转换为对应的字符串列表
+            token_str_list = []
+            # self.token_ids方法，从self.hyp中逐个提取预测出的token，查表找到对应字符
+            for i in self.token_ids:
+                # 从词表中查找 id 对应的 token 字符串
+                # 使用 .get(i, "?") 是为了鲁棒性：万一遇到词表外的未知 id，用 "?" 兜底，防止程序崩溃
+                token_str = self.id2token.get(i, "?")
+                token_str_list.append(token_str)
+                
+            # 2. 将 token 字符串列表还原为人类可读的文本
+            # detokenize 内部会处理 BPE 的 ▁ 符号（替换为空格）以及中英文之间的空格规则
+            self._text = self.detokenize(token_str_list)
+            
         return self._text
 
     # ============================================================
