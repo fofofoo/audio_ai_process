@@ -197,7 +197,7 @@ def part_b(wavs, model_dir, frame_chunks):
     from asr_onnx_decode import (OnnxModel, find_onnx, load_tokens,
                                  find_blank, detokenize)
     from asr_onnx_decode import TAIL_PAD_FRAMES as SRC_TAIL_PAD
-    import asr_decode as mini_dec            # mini 侧，避免 detokenize 重名
+    # mini 侧的文本还原是 AsrDecoder 的实例方法，走已建好的 mini_model 调用
     from asr_decode import AsrDecoder
 
     assert SRC_TAIL_PAD == TAIL_PAD_FRAMES, \
@@ -267,7 +267,7 @@ def part_b(wavs, model_dir, frame_chunks):
         for fc in frame_chunks:
             t0 = time.time()
             ids_mini, st_mini = mini_decode_stream(mini_model, samples, fc)
-            txt_mini = mini_dec.detokenize(
+            txt_mini = mini_model.detokenize(
                 [id2token.get(i, "?") for i in ids_mini])
             t_mini = time.time() - t0
             same = (list(ids_src) == ids_mini)

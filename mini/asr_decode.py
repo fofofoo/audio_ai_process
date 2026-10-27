@@ -9,37 +9,33 @@
 
 模型是 streaming zipformer2 transducer，三段的分工：
 
-    encoder  —— 吃特征，吐出"声学编码"；它带着一大堆**状态张量**，跨块累积，
-                这就是"流式"能记住前文的全部机制。
-    decoder  —— 吃最近若干个 token，吐出"语言编码"（也叫 predictor）。
+    encoder  —— 吃特征，吐出"声学编码"；它带着一大堆**状态张量**，跨块累积，这就是"流式"能记住前文的全部机制,主要负责猜字。
+    decoder  —— 吃最近若干个 token，吐出"语言编码"（也叫 predictor），2TOKEN轻量化CNN(非长记忆的LSTM)，辅助去重、断句。
     joiner   —— 把 encoder 的一帧和 decoder 的输出合起来，输出整个词表的打分。
 
-============================================================
-一、流式的核心：T 与 decode_chunk_len 是两个不同的数
-============================================================
-每次喂给 encoder 的是 T = 61 帧，但时间轴只**前进** decode_chunk_len = 48 帧
-（480ms）。多出来的 13 帧是卷积模块需要的重叠上下文 —— 它们下一轮还要再喂
-一遍。实测每个 chunk 的 encoder 输出是 12 帧，不是 61 也不是 48。
+=========================================================================================
+一、流式 Encoder 编码：部分重叠滑动输入、CNN的4倍时间压缩与transformer的时序声学表征提取
+=========================================================================================
+1. 滑动窗口机制：每次喂给 encoder 的是 T = 61 帧，但时间轴只前进 decode_chunk_len = 48 帧（480ms）。
+   多出的 13 帧是卷积模块必需的重叠上下文，用于将旧的 13 帧与新的 48 帧拼接后送入模型，避免边界补零失真。
 
-所以有三条铁律：
-    · T 是**输入帧数**，不是输出帧数；
-    · encoder 输出的帧数必须**运行时取** encoder_out.shape[1]；
-    · 这两个数都从模型的 metadata 读，不硬编码（换模型就变）。
+2. CNN 降维与升维：输入 (b, 61, 80) 经过两层 kernel_size=3, stride=2 的 1D 卷积，
+   时间维度 n 被严格压缩 4 倍输出 (b, 16, d_model)（若输入 48 帧则输出 12 帧），
+   同时特征维度 s 从 80 维映射至模型隐藏层维度 d_model（如 512）。
 
-============================================================
-二、贪心搜索：blank 不刷新 decoder
-============================================================
+3. 上下文建模：后续 (b, 16, d_model) 作为 token 序列进入 Transformer 模型，
+   通过自注意力机制捕获长距离时序依赖，进一步提取出融合了全局上下文的“高级时序声学表征”。
+
+============================================================================================
+二、贪心搜索：参考decoder基于上一个字的接龙预测值和encoder实际听到的结果 ，joiner 综合决策快速出字
+============================================================================================
 对 encoder 吐出的每一帧，跟当前 decoder 输出一起过 joiner，取 argmax：
-
-    · 如果结果不是 blank —— 把它接到假设尾部，并用最近 context_size 个
-      token 重算一次 decoder 输出；
-    · 如果是 blank —— **什么都不做**，沿用上一次的 decoder 输出。
-
-第二条是省算力的关键：绝大多数帧都是 blank，只有真出新 token 才需要跑一次
-decoder 前向。写出"每帧都刷新"不会报错，只是白白慢好几倍。
-
-假设 hyp 的初始值是 context_size 个 blank，最终结果要把开头这 context_size
-个去掉（它们是占位，不是识别出来的内容）。
+    · 如果joiner结果不是 blank，用最近 context_size 个 token 重算一次 decoder 输出，
+    · 后续将decoder根据这个选出的字继续预测下一个最可能的字，并不断向后词语接龙，这也是搜索这个概念的来源；
+    · 如果joiner结果是 blank —— **什么都不做**，沿用上一次的 decoder 输出。
+    · 贪心的由来，argmax是选字最快的，但模型将直接抛弃其他高概率的字，没有纠错可能了。
+    · 相比之下，束搜索就是每一步都同时保留前 K 条最可能的“词语接龙”路径，通过将新词得分累加到历史总分中，历史中错误的接龙被正确接龙替代，多次更新后各路径历史语句完全固化并被删掉，不再进入打分模型，从而在保证速度的情况避免贪心搜索的“一错到底”。
+    · joiner输出 blank 不刷新 decoder，绝大多数帧都是 blank，只有真出新 token 才需要跑一次decoder 前向，加速模型推理过程。
 
 ============================================================
 三、跨块必须存活的状态
@@ -61,43 +57,7 @@ decoder 前向。写出"每帧都刷新"不会报错，只是白白慢好几倍�
 
 import os
 import re
-
 import numpy as np
-
-
-# ============================================================
-# 一、词表与文本还原（模块级小工具）
-# ============================================================
-def load_tokens(path):
-    """读 tokens.txt，返回 {id: token}。
-
-    每行的格式是 `token id`（token 在前、id 在后）。用 rpartition 而不是
-    split()：BPE token 里用 ▁ 表示词首空格，本身不含空格，但 rpartition
-    对这种格式更稳，遇到多余空白的行也不会崩。
-    """
-    id2token = {}
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\r\n")
-            if not line:
-                continue
-            token, sep, idx = line.rpartition(" ")
-            if not sep:
-                continue
-            id2token[int(idx)] = token
-    return id2token
-
-
-def find_blank(id2token):
-    """在词表里找出 blank 的 id。找不到才退回 0 并提示。
-
-    不要硬编码 0：blank 的 id 是模型定的，换个词表就可能变。
-    """
-    for i, t in id2token.items():
-        if t in ("<blk>", "<blank>"):
-            return i
-    print("警告：tokens.txt 里没找到 <blk>/<blank>，退回 blank_id=0")
-    return 0
 
 
 # 文本还原用的字符区间：
@@ -106,43 +66,13 @@ def find_blank(id2token):
 _CJK = r"一-鿿㐀-䶿"
 _FULLWIDTH = r"　-〿＀-￯"
 
-
-def detokenize(tokens):
-    """把 BPE token 序列拼成可读文本（后处理）。
-
-    不能只做 "".join()，原因有两层：
-
-        1. ▁ 是 BPE 的词首标记，得还原成空格，否则得到「▁昨▁天▁是」。
-        2. 本模型的词表把中文按单字切（▁礼▁拜▁二），单把 ▁ 换成空格会散成
-           「礼 拜 二」。所以还得去空格，但只能去特定位置：
-              - CJK 之间           去   「昨 天」 -> 「昨天」
-              - 全角标点两侧       去   「Monday ，today」 -> 「Monday，today」
-              - CJK 与 ASCII 之间  保留 「是 Monday」不能粘成「是Monday」
-    """
-    text = "".join(tokens).replace("▁", " ")
-    text = re.sub(r"(?<=[%s])\s+(?=[%s])" % (_CJK, _CJK), "", text)
-    text = re.sub(r"\s+(?=[%s])" % _FULLWIDTH, "", text)
-    text = re.sub(r"(?<=[%s])\s+" % _FULLWIDTH, "", text)
-    return text.strip()
-
-
 # ============================================================
 # 二、解码器
 # ============================================================
 class AsrDecoder:
     """三段 onnx 会话 + 流式贪心搜索。
-
     三个 session 由调用方建好传进来（见入口 test_mic_asr_mini.py）——
     本类只管「怎么用模型」，不管「模型从哪来、跑在哪块硬件上」。
-
-    用法::
-
-        dec = AsrDecoder(enc_sess, dec_sess, joi_sess, "weight/xxx/tokens.txt")
-        while 还有特征:
-            text = dec.accept_features(feats)   # 喂一块 (n, 80)，返回当前完整文本
-
-    也可以绕开 accept_features，自己按 run_encoder / run_decoder / run_joiner
-    逐个调用 —— 那三个方法正是 C++ 侧三个 session 的一一对应物。
     """
 
     # onnx 张量类型 -> numpy dtype，用来给状态张量选初值类型
@@ -211,8 +141,8 @@ class AsrDecoder:
             self._state_proto.append((shape, self._DTYPES[n.type]))
 
         # ---- 词表 ----
-        self.id2token = load_tokens(self.tokens_path)
-        self.blank_id = find_blank(self.id2token)
+        self.id2token = self.load_tokens(self.tokens_path)
+        self.blank_id = self.find_blank(self.id2token)
 
         self.reset()
 
@@ -320,6 +250,58 @@ class AsrDecoder:
                 # blank：什么都不做，沿用上一次的 decoder 输出（省算力的关键）
 
         if n_new:
-            self._text = detokenize([self.id2token.get(i, "?")
+            self._text = self.detokenize([self.id2token.get(i, "?")
                                      for i in self.token_ids])
         return self._text
+
+    # ============================================================
+    # 一、词表与文本还原（模块级小工具）
+    # ============================================================
+    def load_tokens(self, path):
+        """读 tokens.txt，返回 {id: token}。
+
+        每行的格式是 `token id`（token 在前、id 在后）。用 rpartition 而不是
+        split()：BPE token 里用 ▁ 表示词首空格，本身不含空格，但 rpartition
+        对这种格式更稳，遇到多余空白的行也不会崩。
+        """
+        id2token = {}
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\r\n")
+                if not line:
+                    continue
+                token, sep, idx = line.rpartition(" ")
+                if not sep:
+                    continue
+                id2token[int(idx)] = token
+        return id2token
+
+
+    def find_blank(self, id2token):
+        """在词表里找出 blank 的 id。找不到才退回 0 并提示。
+
+        不要硬编码 0：blank 的 id 是模型定的，换个词表就可能变。
+        """
+        for i, t in id2token.items():
+            if t in ("<blk>", "<blank>"):
+                return i
+        print("警告：tokens.txt 里没找到 <blk>/<blank>，退回 blank_id=0")
+        return 0
+
+    def detokenize(self, tokens):
+        """把 BPE token 序列拼成可读文本（后处理）。
+
+        不能只做 "".join()，原因有两层：
+
+            1. ▁ 是 BPE 的词首标记，得还原成空格，否则得到「▁昨▁天▁是」。
+            2. 本模型的词表把中文按单字切（▁礼▁拜▁二），单把 ▁ 换成空格会散成
+            「礼 拜 二」。所以还得去空格，但只能去特定位置：
+                - CJK 之间           去   「昨 天」 -> 「昨天」
+                - 全角标点两侧       去   「Monday ，today」 -> 「Monday，today」
+                - CJK 与 ASCII 之间  保留 「是 Monday」不能粘成「是Monday」
+        """
+        text = "".join(tokens).replace("▁", " ")
+        text = re.sub(r"(?<=[%s])\s+(?=[%s])" % (_CJK, _CJK), "", text)
+        text = re.sub(r"\s+(?=[%s])" % _FULLWIDTH, "", text)
+        text = re.sub(r"(?<=[%s])\s+" % _FULLWIDTH, "", text)
+        return text.strip()

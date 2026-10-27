@@ -236,8 +236,13 @@ class AudioPreprocess:
             out.append(proc_frame)
             self._next += 1
 
-        feats = (np.stack(out).astype(np.float32) if out
-                 else np.zeros((0, self.n_mels), dtype=np.float32))
+        if out:
+            # 情况 1：out 列表非空，把列表里的多个 (80,) 一维数组，堆叠成 (帧数, 80) 的二维矩阵
+            feats = np.stack(out).astype(np.float32)
+        else:
+            # 情况 2：out 列表为空，返回一个形状为 (0, 80) 的空矩阵
+            feats = np.zeros((0, self.n_mels), dtype=np.float32)
+
         # 无条件补：跟官方 test_onnx.py 一致。整段不足 80 个样本时本就没有
         # 任何帧，此处会补成 (tail_pad_frames, n_mels) 全 0 —— 这是刻意的，
         # 不要加 "feats.shape[0] > 0" 之类的守卫，否则与批量版语义不一致。
