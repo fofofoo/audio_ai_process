@@ -118,13 +118,13 @@ class AsrDecoder:
         self.n_mels = int(last_channel_num) if not isinstance(last_channel_num, str) else 80  
         
         # 读取asr-encoder第二类输入 状态张量(含KVCache) ----
-        # Zipformer2是类uet结构的transform+cnn混合网络，总计6个stack，每层两到三个block，合计19个block层，时间压缩是先压缩再恢复的，不同stack中的T帧长度不一致。
+        # Zipformer2是类U-Net结构的transformer+cnn混合网络，总计6个stack，每层2到5个block，合计19个block层，时间压缩是先压缩再恢复的，不同stack中的T帧长度不一致。
         # encoder规定了512帧（初始状态）的记忆特征状态，对应一帧10ms，总计是5.12s的历史数据。各stack的时间压缩长度不同，折成帧数是 256/128/64/32
         # 第二类输入要求的 116个 状态向量 主要含三类：
         # 1. 2 个全局状态：processed_lens (1,) int64、embed_states (1,128,3,19) float
         # 2. 76 个 KV Cache 状态, 19个block × 每层 4 个，key/val 形状 (T = 256/128/64/32, batch = 1, key_dim = 128 或 256 / value_dim = 48 或 96)，
         # 3.1 38 个 CNN 边界状态, 19个block × 每层 2 个(conv1 / conv2)，每个 block 除注意力、前馈外还有一个卷积模块，流式架构中在边界不使用padding，而是直接使用历史数据进行因果卷积
-        # 3.2 因此，需要在输入1d 特征左侧拼接历史特征，历史特征的时间长度与卷积核在边界需要补的数据一致，(batch = 1,Channels = 768/256/192, T = kernel_size/2 = 15/7)
+        # 3.2 因此，需要在输入1d 特征左侧拼接历史特征，历史特征的时间长度与卷积核在边界需要补的数据一致，(batch = 1,Channels = 192/256/512/768, T = kernel_size/2 = 15/7)
         self._state_proto = []
         for n in self.encoder.get_inputs()[1:]:
             if n.type not in self._DTYPES:
@@ -210,12 +210,14 @@ class AsrDecoder:
 
     def run_decoder(self, hyp):
         """喂最近 context_size 个 token id，返回 decoder（predictor）输出。"""
+        # self.hyp[-self.context_size:]是最近 context_size 个 token id
         dtype = (np.int64 if self._dec_in.type == "tensor(int64)" else np.int32)
         y = np.array([hyp], dtype=dtype)
         return self.decoder.run([self._dec_out], {self._dec_in.name: y})[0]
 
     def run_joiner(self, encoder_out, decoder_out):
         """把 encoder 一帧与 decoder 输出合起来，返回整个词表的打分。"""
+        # 单帧的enc_feats和上一次接龙预测结果self.decoder_out，共同作为输入
         return self.joiner.run([self._joi_out],
                                {self._joi_in[0]: encoder_out,
                                 self._joi_in[1]: decoder_out})[0]
@@ -254,15 +256,15 @@ class AsrDecoder:
             self.n_chunks += 1
 
             # encoder 网络推理，输入新的61帧音频数据， 输出 高级时序声学表征 enc_feat, (b ,T = 48 / 4 = 12 , hidden_dim)
-            enc_feat = self.run_encoder(x)          # 状态在 self.states 里累积
-            nf = enc_feat.shape[1]                  # nf是非重叠的T_shift = 48帧，时序压缩4倍后的帧数量12
+            enc_feats = self.run_encoder(x)          # 状态在 self.states 里累积
+            nf = enc_feats.shape[1]                  # nf是非重叠的T_shift = 48帧，时序压缩4倍后的帧数量12
             self.n_enc_frames += nf                 # 已经编码的帧
 
             # 逐帧提取非重叠的音频压缩编码后的帧，输入到后续的预测网络decoder 和 联合网络joiner中
             # 注意encoder网络是输入多帧数据，decoder和joiner都是输入单帧数据，因此要顺序逐帧输入编码后的音频特征
             for k in range(nf):
                 # 逐帧提取非重叠的音频压缩编码后的帧
-                cur = enc_feat[0, k:k + 1]          # encoder 的第 k 帧
+                cur = enc_feats[0, k:k + 1]          # encoder 的第 k 帧
                 # 联合网络 joiner 根据 当前的声学表征帧cur 和 上一次出字时 decoder 预测的下一个字，输出音频对应的文字id
                 # .argmax()，贪心算法直接将概率最高的字作为确定的输出字符
                 tid = int(self.run_joiner(cur, self.decoder_out).argmax())
