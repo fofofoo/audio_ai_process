@@ -9,15 +9,15 @@
                              并把同一份音频边播边喂给流式 ASR，底部实时显示识别文字；
                              播放结束后窗口保持打开，关闭窗口即退出程序
 
-三块图的绘制逻辑都在 src/live_audio_view.py 里，与麦克风脚本 realtime_mic_monitor.py 共用同一份代码。
-识别逻辑全部来自 src/streaming_asr.StreamingAsr，与麦克风版是同一个类。
+三块图的绘制逻辑都在 qt/live_audio_view.py 里，与麦克风脚本 realtime_mic_monitor.py 共用同一份代码。
+识别逻辑全部来自 qt/streaming_asr.StreamingAsr，与麦克风版是同一个类。
 
 为什么识别要放单独线程：喂一次 encoder 最坏要约 40ms，而画面每 25ms 就要推一帧，
 放在主线程会让滚动卡顿。所以主线程只负责「把当前 hop 塞进队列」和「读一下最新文本」，
 真正的解码在后台线程里做。
 
-运行环境：py310-gpu
-    python test_spectrogram.py
+运行环境：py310-gpu（在项目根目录执行）
+    python -I qt/test_spectrogram.py
 
 依赖：numpy / pandas / scipy / sounddevice / pyqtgraph(PyQt5) / onnxruntime / soundfile
 """
@@ -38,12 +38,12 @@ import sounddevice as sd
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
 
-# 核心库都在 src/ 下。正常 `python test_spectrogram.py` 时脚本目录本来就在
-#   sys.path 里，找不到 src/ 的子模块；加 -I 时连脚本目录都不在。两种情况下
-#   都得手动把 src/ 塞进去。
-_SRC = Path(__file__).resolve().parent / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+# 核心库与入口脚本都在 qt/ 下。正常 `python qt/test_spectrogram.py` 时脚本
+#   目录本来就在 sys.path 里；加 -I 时连脚本目录都不在。两种情况下都手动把
+#   qt/（即本文件所在目录）塞进去。
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
 from live_audio_view import LiveAudioView, estimate_levels_from_wav
 from streaming_asr import AsrWorker, StreamingAsr, find_model_dir, setup_stdout_utf8
@@ -52,7 +52,7 @@ from streaming_asr import AsrWorker, StreamingAsr, find_model_dir, setup_stdout_
 # 二、全局配置
 # ============================================================
 # --- 数据路径 ---
-DATA_ROOT = Path(__file__).resolve().parent / "data"
+DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 CSV_DIR = DATA_ROOT / "aishell1_subset"
 
 # --- 播放参数 ---

@@ -19,7 +19,7 @@
     与纯可视化的帧间隔中位数 31.3ms vs 31.2ms、最坏 47.2ms vs 47.1ms —— 噪声级别。
 
 运行环境：conda py310-gpu
-    python realtime_mic_monitor.py
+    python -I qt/realtime_mic_monitor.py
 
 关窗口即退出；退出时会把整段识别结果打印到终端。
 """
@@ -37,12 +37,12 @@ import pyqtgraph as pg
 import sounddevice as sd
 from pyqtgraph.Qt import QtCore
 
-# 核心库都在 src/ 下。正常 `python realtime_mic_monitor.py` 时脚本目录本来就在
-#   sys.path 里，找不到 src/ 的子模块；加 -I 时连脚本目录都不在。两种情况下
-#   都得手动把 src/ 塞进去。
-_SRC = Path(__file__).resolve().parent / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+# 核心库与入口脚本都在 qt/ 下。正常 `python qt/realtime_mic_monitor.py` 时
+#   脚本目录本来就在 sys.path 里；加 -I 时连脚本目录都不在。两种情况下都手动
+#   把 qt/（即本文件所在目录）塞进去。
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
 from live_audio_view import LiveAudioView
 from streaming_asr import AsrWorker, StreamingAsr, find_model_dir, setup_stdout_utf8

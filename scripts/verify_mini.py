@@ -1,29 +1,30 @@
 # -*- coding: utf-8 -*-
-"""mini 版与 src 版逐点对拍 —— 把 mini 当第三把数值标尺来验。
+"""mini 版（现 src/）与原 src 版（现 qt/）逐点对拍 —— 把 mini 当第三把数值标尺来验。
 
 ============================================================
 这份脚本验什么
 ============================================================
-mini/ 下的实现是**独立重写**的（不 import src/ 任何东西），所以它天然可以
-拿来跟 src/ 互相印证：两边算的是同一件事，若逐点一致，说明两份实现都没写错。
+mini 实现（现 src/）是**独立重写**的（不 import qt/ 任何东西），所以它天然可以
+拿来跟原 src 版（现 qt/）互相印证：两边算的是同一件事，若逐点一致，说明两份
+实现都没写错。
 
     A 部分：前端对拍
-        src.traditional_features.TraditionalFeatureExtractor.frontend_for_onnx
-        vs mini.audio_preprocess.AudioPreprocess
+        qt/traditional_features.py 的 TraditionalFeatureExtractor.frontend_for_onnx
+        vs src/audio_preprocess.py 的 AudioPreprocess
         同一段 wav，mini 侧按多种块长流式喂（160/257/400/1000/一次全喂），
         逐点比 max|Δ|。另测极短信号打「edge 退化分支」。
 
     B 部分：解码端到端对拍
-        同一段 wav，src 走「批量前端 + OnnxModel.decode」，
-        mini 走「流式前端 + AsrDecoder.accept_features」，比 **token 序列**
-        是否完全一致。这一条同时验 mini 的解码不变量（> T 判据、尾部补 100 帧、
-        blank 不刷新 decoder、状态跨块存活）。
+        同一段 wav，qt 版走「批量前端 + OnnxModel.decode」，
+        mini 版（src/）走「流式前端 + AsrDecoder.accept_features」，比 **token
+        序列**是否完全一致。这一条同时验 mini 的解码不变量（> T 判据、尾部补
+        100 帧、blank 不刷新 decoder、状态跨块存活）。
 
 为什么期望「几乎逐点相同」而不是「大致相同」：
-    src 的 mel 滤波器组与窗函数都是 float64、公式与 mini 逐字一致；两边唯一的
-    差异是求和的次序（src 用 power @ filters.T 走 BLAS，mini 用显式稀疏循环）
-    与 |z|² 的实现（np.abs vs real²+imag²）。这些在 float64 下只差最后几个 bit，
-    而两边最终都 cast 到 float32，所以结果应当逐点相同，或最多差 1 个 ulp。
+    qt 版的 mel 滤波器组与窗函数都是 float64、公式与 mini 版逐字一致；两边唯一
+    的差异是求和的次序（qt 版用 power @ filters.T 走 BLAS，mini 版用显式稀疏
+    循环）与 |z|² 的实现（np.abs vs real²+imag²）。这些在 float64 下只差最后几
+    个 bit，而两边最终都 cast 到 float32，所以结果应当逐点相同，或最多差 1 个 ulp。
 
 跑法（按 CLAUDE.md：一律 python -I，且脚本自己插 sys.path）：
     python -I scripts/verify_mini.py --part a          # 只跑前端对拍（快）
@@ -41,10 +42,10 @@ import time
 import numpy as np
 
 # -I 隔离模式下脚本目录与 PYTHONPATH 都不进 sys.path，三个目录都得手动插：
-#   项目根（只为保持与其它脚本一致）、src/（被对拍方）、mini/（待验方）
+#   项目根（只为保持与其它脚本一致）、qt/（原 src 版）、src/（mini 版）
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-for _p in (_ROOT, os.path.join(_ROOT, "src"), os.path.join(_ROOT, "mini")):
+for _p in (_ROOT, os.path.join(_ROOT, "qt"), os.path.join(_ROOT, "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -52,7 +53,7 @@ from console_utf8 import setup_stdout_utf8
 from traditional_features import TraditionalFeatureExtractor, read_wav
 from audio_preprocess import AudioPreprocess
 
-# 尾部补帧数。与 src/asr_onnx_decode.py 的 TAIL_PAD_FRAMES 是同一个值，
+# 尾部补帧数。与 qt/asr_onnx_decode.py 的 TAIL_PAD_FRAMES 是同一个值，
 # 这里单独写死是为了让 A 部分不必 import asr_onnx_decode（那会拖进
 # onnxruntime 与 soundfile）。B 部分会断言两边确实相等。
 TAIL_PAD_FRAMES = 100
@@ -302,7 +303,7 @@ def part_b(wavs, model_dir, frame_chunks):
 def main():
     setup_stdout_utf8()
     ap = argparse.ArgumentParser(
-        description="mini 版与 src 版逐点对拍",
+        description="mini 版（src/）与原 src 版（qt/）逐点对拍",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--part", choices=("a", "b", "ab"), default="ab")
     ap.add_argument("--model-dir", default=None)

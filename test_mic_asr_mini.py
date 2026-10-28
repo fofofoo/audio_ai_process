@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
-"""实时麦克风语音识别 —— mini 版入口（三条流水线串起来）。
+"""实时麦克风语音识别 —— mini 版入口（三条流水线 + 一个可视化窗口）。
 
 ============================================================
 这份代码是干什么的
 ============================================================
-把 mini/ 下的三条流水线按顺序接起来，做一个能对着麦克风说话的实时识别
-程序。不用 Qt、不做可视化，全程用 print 交互，方便看懂整体结构。
+把 src/ 下的三条流水线按顺序接起来，做一个能对着麦克风说话的实时识别
+程序。不用 Qt：识别结果用 print 原地刷新，同时开一个 OpenCV 窗口，把同一份
+特征画成滚动语谱图，识别文字也直接画在窗口底部。
 
-三条流水线各管一段，彼此不知道对方的存在：
+三条流水线 + 一个显示单元，各管一段，彼此不知道对方的存在：
 
-    mic_client.py       MicClient          声卡 -> 裸音频块
-    audio_preprocess.py AudioPreprocess    波形块 -> LogFBank 特征
-    asr_decode.py       AsrDecoder         特征 -> 中文文本
+    mic_client.py           MicClient           声卡 -> 裸音频块
+    audio_preprocess.py     AudioPreprocess     波形块 -> LogFBank 特征
+    asr_decode.py           AsrDecoder          特征 -> 中文文本
+    spectrogram_image.py    SpectrogramImage    特征 -> BGR 滚动语谱图画布
 
 主循环干的事非常直白：
 
-    取一块音频 -> 算特征 -> 喂解码器 -> 打印文本，如此往复。
+    取一块音频 -> 算特征 -> 喂解码器 -> 画字 -> 显示，如此往复。
+    accept_features() 直接返回整幅画布，main 里画完字就 imshow，
+    同一份特征同时喂给 AsrDecoder 和 SpectrogramImage，两边互不知道对方。
 
 ============================================================
 调用顺序（对照 main 里的编号）
@@ -23,12 +27,16 @@
     1) 连接麦克风          mic.start()
     2) 建三个 onnx session build_ort_sessions()（路径写在文件顶部）
        装配解码器          AsrDecoder(encoder, decoder, joiner, tokens_path)
+       装配语谱图          SpectrogramImage(...)
     3) 预处理              preprocessor.accept_waveform(samples)
     4) 模型推理 + 5) 后处理 asr_decoder.accept_features(feats)
-    6) 打印结果            stdout 原地刷新
+    6) 可视化              cv_frame = spec_view.accept_features(feats)
+                          cv2.putText + cv2.imshow
+    7) 打印结果            stdout 原地刷新 + 窗口底部识别条
 
-结束（Ctrl+C）后还要走一次收尾：补完尾部帧、并在特征尾部补 100 帧 0，
-再把剩下的一起解掉 —— 否则最后几个字会丢。
+结束（Ctrl+C 或窗口里按 q/Esc）后还要走一次收尾：补完尾部帧、并在特征
+尾部补 100 帧 0，再把剩下的一起解掉 —— 否则最后几个字会丢。那 100 帧 0
+只喂解码器、不喂可视化，否则语谱图末尾会多出一块比静音还亮的假色块。
 
 用法：
     python -I test_mic_asr_mini.py
@@ -44,14 +52,17 @@ import sys
 import time
 
 # -I 隔离模式下脚本目录不进 sys.path（也忽略 PYTHONPATH），
-#   不显式插一次，下面的 from mini.* 会直接 ImportError
+#   不显式插一次，下面的 from src.* 会直接 ImportError
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from mini.audio_preprocess import AudioPreprocess
-from mini.asr_decode import AsrDecoder
-from mini.mic_client import MicClient, list_devices
+import cv2
+
+from src.audio_preprocess import AudioPreprocess
+from src.asr_decode import AsrDecoder
+from src.mic_client import MicClient, list_devices
+from src.spectrogram_image import SpectrogramImage
 import onnxruntime as ort
 
 # onnxruntime 推理用cpu或gpu
@@ -59,6 +70,12 @@ PROVIDERS = ["CPUExecutionProvider"]    #"CUDAExecutionProvider",
 
 # 麦克风设备：None = 系统默认输入设备；也可以写设备编号（如 1）或设备名
 MIC_DEVICE = None
+
+# 语谱图窗口：400 列 x 10ms = 4 秒滚动窗口；底部 56px 用来画识别结果
+SPEC_COLS = 400
+SPEC_FOOTER_H = 56
+# 窗口标题只能用 ASCII：部分 OpenCV 构建对非 ASCII 标题处理不一致
+SPEC_WINDOW = "mini spectrogram"
 
 
 def build_ort_sessions(ENCODER_ONNX,DECODER_ONNX,JOINER_ONNX):
@@ -125,7 +142,9 @@ def main():
     #  2.加载三个onnx模型，初始化预处理和推理实例
     # ========================================================
     #  asr各个模型路径
-    _ASR_DIR = (r"weight\sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05")
+    _ASR_DIR = os.path.join(
+        _HERE, "weight",
+        "sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05")
     ENCODER_ONNX = os.path.join(_ASR_DIR, "encoder.int8.onnx")
     DECODER_ONNX = os.path.join(_ASR_DIR, "decoder.onnx")
     JOINER_ONNX = os.path.join(_ASR_DIR, "joiner.int8.onnx")
@@ -135,14 +154,23 @@ def main():
     # 2.2 初始化asr推理器，组合三个session和词表的语言转文字工作流水线
     asr_decoder = AsrDecoder(encoder_session, decoder_session, joiner_session, TOKENS_TXT)
     # 2.3 初始化预处理类，将音频转换为LogFBank特征，输入asr模型，n_mels 跟着模型走，避免两边维度对不上
+    #     注意：这里保留默认 tail_pad_frames=100，收尾时解码要用；那 100 帧 0 不喂可视化（见第 5 节）
     preprocessor = AudioPreprocess(sample_rate=16000, n_mels=asr_decoder.n_mels)
+    # 2.4 初始化语谱图：和 AsrDecoder 一样只接收特征，
+    #     底部预留 SPEC_FOOTER_H 像素白条，识别文字由入口用 cv2.putText 画进去
+    spec_view = SpectrogramImage(
+        n_mels=preprocessor.n_mels,
+        cols=SPEC_COLS,
+        frame_shift=preprocessor.frame_step / float(preprocessor.sample_rate),
+        footer_h=SPEC_FOOTER_H,
+        label="mic")
 
     # ========================================================
     # 3.打印模型信息、预处理参数、麦克风参数
     # ========================================================  
     info = asr_decoder.info()
     print("=" * 74)
-    print("mini 流式 ASR —— 预处理 / 解码 / 麦克风 三条流水线")
+    print("mini 流式 ASR —— 预处理 / 解码 / 麦克风 + 语谱图")
     print("=" * 74)
     print("权重  : %s" % _ASR_DIR)
     print("onnx  : encoder=%s  decoder=%s  joiner=%s" % (os.path.basename(ENCODER_ONNX), os.path.basename(DECODER_ONNX), os.path.basename(JOINER_ONNX)))
@@ -156,7 +184,7 @@ def main():
     print()
 
     # ========================================================
-    # 4.主循环：取音频 -> 预处理 -> 推理 -> 后处理 -> 打印
+    # 4.主循环：取音频 -> 预处理 -> 推理 -> 后处理 -> 打印 -> 刷新语谱图
     # ========================================================
     # 4.1 打开麦克风
     mic.start()
@@ -166,23 +194,35 @@ def main():
     shown = ""
     t_start = time.perf_counter()
     print("=" * 74)
-    print("识别结果(ctrl+C 退出)：" )
+    print("识别结果(ctrl+C 或窗口里按 q/Esc 退出)：" )
+    quit_now = False
     try:
-        while True:
+        while not quit_now:
             # 4.1 取音频
             samples = mic.get_last_audio()
-            if samples is None:
+            if samples is not None:
+                # 4.2 预处理
+                feats = preprocessor.accept_waveform(samples)
+                # 4.3 可视化返回伪彩语谱图
+                cv_frame = spec_view.accept_features(feats)
+                # 4.4 asr推理 + 后处理
+                text = asr_decoder.accept_features(feats)
+                # 4.5 打印：只在变化时刷新 stdout（窗口每帧都重画）
+                if text != shown:
+                    shown = text
+                    sys.stdout.write("\r%s" % text.ljust(72))
+                    sys.stdout.flush()
+                # 4.6 识别结果画到底部白条，再显示（putText 只支持 ASCII）
+                cv2.putText(cv_frame, text, (8, cv_frame.shape[0] - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0),
+                            1, cv2.LINE_AA)
+                cv2.imshow(SPEC_WINDOW, cv_frame)
+            else:
                 time.sleep(0.002)      # 还没攒到新数据，让出 CPU 别空转
-                continue
-            # 4.2 预处理
-            feats = preprocessor.accept_waveform(samples)   
-            # 4.3 推理 + 后处理
-            text = asr_decoder.accept_features(feats)       
-            # 4.4 打印：只在变化时刷新
-            if text != shown:                        
-                shown = text
-                sys.stdout.write("\r%s" % text.ljust(72))
-                sys.stdout.flush()
+            # 4.7 处理按键（没新数据时也要泵一次事件，窗口才不会假死）
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                quit_now = True
     except KeyboardInterrupt:
         pass
 
@@ -196,8 +236,17 @@ def main():
     #     chunk 的尾段也能被解码 —— 少了这一步，最后几个字会被整段丢掉
     leftover = mic.get_last_audio()
     if leftover is not None:
-        asr_decoder.accept_features(preprocessor.accept_waveform(leftover))
+        feats = preprocessor.accept_waveform(leftover)
+        spec_view.accept_features(feats)
+        asr_decoder.accept_features(feats)
+    # 这一步返回的特征尾部补了 100 帧 0（解码需要），只喂解码器；
+    # 喂给可视化的话，语谱图末尾会多出一块比静音还亮的假色块
     text = asr_decoder.accept_features(preprocessor.input_finished())
+    # 最后一屏按当前缓存重画（不喂补 0 特征），把完整识别结果写到底部
+    cv_frame = spec_view.frame()
+    cv2.putText(cv_frame, text, (8, cv_frame.shape[0] - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.imshow(SPEC_WINDOW, cv_frame)
     # 5.3 正常退出，统计结果
     dur = time.perf_counter() - t_start
     print("\n")
@@ -215,6 +264,13 @@ def main():
         print("提示：峰值幅度为 0，麦克风可能没采到声音，"
               "可改顶部 MIC_DEVICE 指定别的设备；"
               "取消第 1 节里 list_devices() 那行的注释即可列出本机设备。")
+    # 5.5 最后一屏语谱图：按 q/Esc 退出就直接关窗，否则停住等按键
+    if quit_now:
+        cv2.destroyAllWindows()
+    else:
+        print("\n按任意键关闭语谱图窗口……")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

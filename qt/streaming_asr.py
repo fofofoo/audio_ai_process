@@ -50,11 +50,11 @@ L 恰好等于 48k + 61 时多喂一次 encoder，尾部多吐出几个 token，
 
 离线验证（按 chunk 样本一块一块喂整条 wav，并与批量结果对拍）::
 
-    python -I src/streaming_asr.py --model-dir <权重目录> --batch-check
+    python -I qt/streaming_asr.py --model-dir <权重目录> --batch-check
 
 实时麦克风（结束按 Ctrl+C）::
 
-    python -I src/streaming_asr.py --model-dir <权重目录> --mic
+    python -I qt/streaming_asr.py --model-dir <权重目录> --mic
 
     --device 不给就用系统默认输入设备；--list-devices 先看看有哪些设备。
 """

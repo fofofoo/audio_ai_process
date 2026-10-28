@@ -15,8 +15,8 @@ import sys
 
 # -I 模式下脚本目录不进 sys.path，这里显式加回，才能 import 到项目根下的模块
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# 核心库现在在 src/ 下：根目录用来 import 入口脚本，src/ 用来 import 核心库
-for _p in (_ROOT, os.path.join(_ROOT, "src")):
+# 核心库现在在 qt/ 下：根目录用来 import 入口脚本，qt/ 用来 import 核心库
+for _p in (_ROOT, os.path.join(_ROOT, "qt")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

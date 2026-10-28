@@ -19,7 +19,7 @@
        基准测试铺路。
 
 用法：
-    python -I src/asr_onnx_decode.py --model-dir <权重目录>
+    python -I qt/asr_onnx_decode.py --model-dir <权重目录>
                                  [--frontend ours|knf|both]
                                  [--wav a.wav b.wav ...]
                                  [--out result.txt]

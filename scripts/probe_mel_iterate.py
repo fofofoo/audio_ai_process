@@ -8,9 +8,9 @@ knf.MelBanks.get_matrix() 逐点比对，迭代到一致。
 import os
 import sys
 
-# 核心库都在 src/ 下：根目录用来 import 入口脚本，src/ 用来 import 核心库
+# 核心库都在 qt/ 下：根目录用来 import 入口脚本，qt/ 用来 import 核心库
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (_ROOT, os.path.join(_ROOT, "src")):
+for _p in (_ROOT, os.path.join(_ROOT, "qt")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

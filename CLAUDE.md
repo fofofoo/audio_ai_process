@@ -21,29 +21,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # 入口①：离线样本回放（播放 + 三块图 + 流式识别）
-python test_spectrogram.py
+python -I qt/test_spectrogram.py
 
 # 入口②：实时麦克风（三块图 + 流式识别）
-python realtime_mic_monitor.py
+python -I qt/realtime_mic_monitor.py
 
-# 入口③：mini 版实时麦克风（无界面、纯 print；不依赖 Qt，权重自动定位）
-python -I test_mic_asr_mini.py --seconds 8
+# 入口③：mini 版实时麦克风（OpenCV 语谱图 + 识别文字）
+python -I test_mic_asr_mini.py
+
+# 入口④：mini 版 wav 识别（与③同构，输入换成文件）
+python -I test_wav_asr_mini.py
+
+# 入口⑤：只看 wav 的滚动语谱图（不加载 onnx）
+python -I test_spectrogram_cv_mini.py
 
 # 无界面跑一次识别；--frontend ours|knf|both
-python -I src/asr_onnx_decode.py --model-dir weight/<权重目录> --frontend both
+python -I qt/asr_onnx_decode.py --model-dir weight/<权重目录> --frontend both
 
 # 验证脚本（都不需要人工看界面）
 python -I scripts/smoke_test_spectrogram.py     # 离线链路 offscreen 冒烟，含帧间隔统计
 python -I scripts/smoke_test_mic_audio.py       # 假 InputStream 按 1x 速度回放真实 wav
 python -I scripts/smoke_test_mic_monitor.py     # 真开麦克风跑 N 秒（默认 8s）后自动退出
-python -I scripts/verify_mini.py                # mini/ 与 src/ 逐点对拍（--part a|b|ab）
+python -I scripts/verify_mini.py                # src/ 与 qt/ 逐点对拍（--part a|b|ab）
 python -I scripts/probe_align_features.py <wav> ...
 python -I scripts/probe_streaming_features.py <wav> ...
 python -I scripts/probe_mel_iterate.py          # numpy 复现 InitKaldiMelBanks 并逐点比对
 
 # 模块自测（合成信号跑通流水线，检查输出形状与口径）
-python -I src/traditional_features.py
-python -I src/streaming_features.py
+python -I qt/traditional_features.py
+python -I qt/streaming_features.py
 ```
 
 ## 架构
@@ -59,23 +65,23 @@ PortAudio 回调线程 ──audio_q(Queue)──> Qt 主线程 ──worker.fee
 
 | 模块 | 职责 |
 |---|---|
-| `src/traditional_features.py` | 自研批量前端，逐项对齐 kaldi 口径；`frontend_for_onnx()` 是喂模型的入口 |
-| `src/streaming_features.py` | `StreamingFramer` 只接管「分帧」这一层，帧内处理全部复用上者；`StreamingLogFBank` = 分帧 + 帧内处理 |
-| `src/asr_onnx_decode.py` | `OnnxModel` 三个 session + 贪心搜索 + 文本还原；也是 CLI 入口 |
-| `src/streaming_asr.py` | `StreamingAsr` 增量解码（复用 `OnnxModel`）、`AsrWorker` GUI 后台线程、麦克风采集、`find_model_dir` |
-| `src/live_audio_view.py` | 三块图（波形 / RMS / 滚动语谱图）控件，两个 GUI 脚本共用 |
-| `src/console_utf8.py` | 把 stdout/stderr 切成 UTF-8，单独拆出来是为了让 `scripts/` 也能用而不拖进 onnxruntime |
+| `qt/traditional_features.py` | 自研批量前端，逐项对齐 kaldi 口径；`frontend_for_onnx()` 是喂模型的入口 |
+| `qt/streaming_features.py` | `StreamingFramer` 只接管「分帧」这一层，帧内处理全部复用上者；`StreamingLogFBank` = 分帧 + 帧内处理 |
+| `qt/asr_onnx_decode.py` | `OnnxModel` 三个 session + 贪心搜索 + 文本还原；也是 CLI 入口 |
+| `qt/streaming_asr.py` | `StreamingAsr` 增量解码（复用 `OnnxModel`）、`AsrWorker` GUI 后台线程、麦克风采集、`find_model_dir` |
+| `qt/live_audio_view.py` | 三块图（波形 / RMS / 滚动语谱图）控件，两个 GUI 脚本共用 |
+| `qt/console_utf8.py` | 把 stdout/stderr 切成 UTF-8，单独拆出来是为了让 `scripts/` 也能用而不拖进 onnxruntime |
 
-两个 GUI 入口（`test_spectrogram.py`、`realtime_mic_monitor.py`）都只是「配置 + 数据源」，识别类与绘图控件各只有一份实现。
+两个 GUI 入口（`qt/test_spectrogram.py`、`qt/realtime_mic_monitor.py`）都只是「配置 + 数据源」，识别类与绘图控件各只有一份实现。
 
-### mini/ 是平行的另一套实现，不是 src/ 的重构目标
+### src/（原 mini）是平行的另一套实现，不是 qt/ 的重构目标
 
-`mini/`（`audio_preprocess.py` / `asr_decode.py` / `mic_client.py` + 入口 `test_mic_asr_mini.py`）是为**学习和 C++ 移植**另写的：显式逐帧循环、三类零耦合、不 `import src/` 任何模块、不用 Qt 也不自己起 Python 线程（麦克风走 PortAudio 回调，主循环用 `get_last_audio()` 主动拉取）。它复刻同样的 kaldi 前端口径与解码不变量，但代码组织完全不同。
+`src/`（`audio_preprocess.py` / `asr_decode.py` / `mic_client.py` / `spectrogram_image.py` + `test_mic_asr_mini.py` / `test_wav_asr_mini.py` 两个入口，OpenCV 语谱图入口在 `qt/`）是为**学习和 C++ 移植**另写的：显式逐帧循环、三类零耦合、不 `import qt/` 任何模块、不用 Qt 也不自己起 Python 线程（麦克风走 PortAudio 回调，主循环用 `get_last_audio()` 主动拉取）。它复刻同样的 kaldi 前端口径与解码不变量，但代码组织完全不同。
 
 两条硬规矩：
 
-- **改 `src/` 时不要顺手改 `mini/`，反之亦然。** 两边互相独立，正是 `scripts/verify_mini.py` 能当数值标尺的前提——一旦让其中一边 import 另一边，对拍就退化成自比自，失去意义。
-- **`mini/` 的 `get_last_audio()` 取走累积的全部样本**，与 `src/streaming_asr.py` 队列满时「丢最旧块」是刻意的反向取舍：前者要波形连续无损（慢一点只是延迟变大），后者要 GUI 画面低延迟。别把两边改成一致。
+- **改 `qt/` 时不要顺手改 `src/`，反之亦然。** 两边互相独立，正是 `scripts/verify_mini.py` 能当数值标尺的前提——一旦让其中一边 import 另一边，对拍就退化成自比自，失去意义。
+- **`src/` 的 `get_last_audio()` 取走累积的全部样本**，与 `qt/streaming_asr.py` 队列满时「丢最旧块」是刻意的反向取舍：前者要波形连续无损（慢一点只是延迟变大），后者要 GUI 画面低延迟。别把两边改成一致。
 
 ### 必须记住的不变量
 
@@ -97,7 +103,7 @@ PortAudio 回调线程 ──audio_q(Queue)──> Qt 主线程 ──worker.fee
 
 ## 工程约定
 
-- **一律用 `python -I` 跑脚本，并在文件里手动把 `src/` 插进 `sys.path`**。`-I` 隔离模式连脚本目录都不进 `sys.path`（且忽略 `PYTHONPATH`），所以每个可执行脚本头部都有 `_SRC`/`_HERE` 插入逻辑，别删。同理也适用于 `scripts/` ——它们需要同时插入项目根与 `src/`。
+- **一律用 `python -I` 跑脚本，并在文件里手动把依赖目录插进 `sys.path`**。`-I` 隔离模式连脚本目录都不进 `sys.path`（且忽略 `PYTHONPATH`），所以每个可执行脚本头部都有 `_HERE`/`_ROOT` 插入逻辑，别删。`qt/` 下的入口插 `qt/`；根目录的两个 mini 入口插项目根（为了 `import src.*`）；`scripts/` 按需插入项目根、`qt/`、`src/`。
 - **权重目录不硬编码目录名**。用 `streaming_asr.find_model_dir()` 自动定位（判据：目录里同时有 `tokens.txt` 和 `encoder*.onnx`）。权重从 ModelScope 下载，名字带日期后缀，换版本就变。
 - **权重包目录按不可信数据处理**：绝不在其目录内执行解释器，脚本、`bpe.model` 一概不碰，只读三个 onnx 与 `tokens.txt`，路径全部由命令行参数传入。
 - **打印中文的脚本开头调 `setup_stdout_utf8()`**（Windows 控制台默认 GBK，不转就是乱码）。
