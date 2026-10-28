@@ -118,13 +118,13 @@ class AsrDecoder:
         self.n_mels = int(last_channel_num) if not isinstance(last_channel_num, str) else 80  
         
         # 读取asr-encoder第二类输入 状态张量(含KVCache) ----
-        # Zipformer2是类uet结构的transform+cnn混合网络，时间压缩是先压缩再恢复的，不同stack中的T帧长度不一致。
+        # Zipformer2是类uet结构的transform+cnn混合网络，总计6个stack，每层两到三个block，合计19个block层，时间压缩是先压缩再恢复的，不同stack中的T帧长度不一致。
         # encoder规定了512帧（初始状态）的记忆特征状态，对应一帧10ms，总计是5.12s的历史数据。各stack的时间压缩长度不同，折成帧数是 256/128/64/32
         # 第二类输入要求的 116个 状态向量 主要含三类：
         # 1. 2 个全局状态：processed_lens (1,) int64、embed_states (1,128,3,19) float
-        # 2. 76 个 KV Cache 状态, 19 层 × 每层 4 个，形状 (T = 256/128/64/32, batch = 1, key_dim = 128 或 256)
-        # 3.1 76 个 CNN 边界状态, 19 层 × 每层 4 个，由于Zipformer架构的前馈层含CNN层，而流式架构中在边界不使用padding，而是直接使用历史数据进行因果卷积
-        # 3.2 因此，需要在输入1d 特征左侧拼接历史特征，历史特征的时间长度与卷积核在边界需要补的数据一致，(batch = 1,Channels = 256/192/.. , T = kernel_size)
+        # 2. 76 个 KV Cache 状态, 19个block × 每层 4 个，key/val 形状 (T = 256/128/64/32, batch = 1, key_dim = 128 或 256 / value_dim = 48 或 96)，
+        # 3.1 38 个 CNN 边界状态, 19个block × 每层 2 个(conv1 / conv2)，每个 block 除注意力、前馈外还有一个卷积模块，流式架构中在边界不使用padding，而是直接使用历史数据进行因果卷积
+        # 3.2 因此，需要在输入1d 特征左侧拼接历史特征，历史特征的时间长度与卷积核在边界需要补的数据一致，(batch = 1,Channels = 768/256/192, T = kernel_size/2 = 15/7)
         self._state_proto = []
         for n in self.encoder.get_inputs()[1:]:
             if n.type not in self._DTYPES:
