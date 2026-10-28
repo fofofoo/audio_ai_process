@@ -27,7 +27,7 @@ wav 其实已经整段读进内存，但主循环按 1x 节奏 sleep，每 10ms 
 ============================================================
     横轴：时间，左旧右新，最新一列贴在最右端
     纵轴：Mel 通道，低频在**下**、高频在上（Mel 轴非线性，故不标 Hz 刻度）
-    亮度：对数能量；配色 viridis，与 Qt 版一致
+    亮度：对数能量；配色 viridis
     顶部：白色信息条，显示当前时间 / 窗口 / 色阶（ASCII，cv2 字体限制）
     底部：本入口没有识别结果，所以不预留文字条
 
@@ -80,8 +80,7 @@ FEED_REALTIME = True   # True = 按 1x 节奏喂；False = 尽快喂完，画面
 CALIBRATE_FRAMES = 50  # 用前 0.5 秒的特征标定色阶，之后锁死
 PLOT_SIZE = (1200, 300)     # 语谱图本身的显示尺寸（宽, 高），80 行太矮需要放大
 HEADER_H = 52               # 顶部信息条高度：文字放这里，不遮挡语谱图
-# 与 Qt 版（qt/live_audio_view.py）一致：pyqtgraph 用 viridis、白底黑字。
-# OpenCV 的 COLORMAP_VIRIDIS 与 pyqtgraph 的是同一张 matplotlib 色表。
+# viridis 伪彩 + 白底黑字信息条；OpenCV 的 COLORMAP_VIRIDIS 就是那张 matplotlib 色表。
 COLORMAP = cv2.COLORMAP_VIRIDIS
 SAVE_PATH = "spectrogram_mini.png"
 # 窗口标题只能用 ASCII：部分 OpenCV 构建对非 ASCII 标题处理不一致

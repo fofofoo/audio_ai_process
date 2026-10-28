@@ -22,8 +22,8 @@ src/ 里每个单元只干一件事，彼此靠数据接口相连：
 
 依赖：只用 numpy + OpenCV。本模块不负责写文字，底部白条（footer_h）只是
 给调用方留一块背景，写什么、怎么写在入口里用 cv2.putText 决定。
-**不 import qt/**：src/（mini 版）是独立的另一套实现，与 qt/ 互不引用，
-scripts/verify_mini.py 的对拍才有意义。
+三个类（AudioPreprocess / AsrDecoder / 本模块）互不引用，只靠数据接口相连，
+保持每个文件都能独立读懂、独立移植。
 
 ============================================================
 一、坐标与朝向（最容易画反的地方）
@@ -194,7 +194,7 @@ class SpectrogramImage:
             plot_size      —— 语谱图的显示尺寸（宽, 高）；n_mels 行太矮，需要放大
             header_h       —— 顶部白色信息条高度（ASCII 文字）
             footer_h       —— 底部白色条高度，留给调用方写文字；0 = 不预留
-            colormap       —— OpenCV colormap；默认 viridis，与 Qt 版一致
+            colormap       —— OpenCV colormap；默认 viridis
             label          —— 信息条第一行；非 ASCII 字符会被替换成 ?
         """
         self.n_mels = int(n_mels)
