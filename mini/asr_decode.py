@@ -118,10 +118,11 @@ class AsrDecoder:
         self.n_mels = int(last_channel_num) if not isinstance(last_channel_num, str) else 80  
         
         # 读取asr-encoder第二类输入 状态张量(含KVCache) ----
-        # encoder保留了最近 4 个 chunk，48 帧的特征状态，由于cnn的下采样，48 帧实际对应 480ms * 4 = 1920 ms的历史数据
-        # 116个 状态向量 主要含三类：
-        # 1. 2 个全局状态，单个数值，(1, )
-        # 2. 38 个 KV Cache 状态, (hidden_dim = 256 , batch = 1, T = 48), 注意力模块总计能获取 1920 + 480 = 2.4s的语音信息。
+        # Zipformer2是类uet结构的transform+cnn混合网络，时间压缩是先压缩再恢复的，不同stack中的T帧长度不一致。
+        # encoder规定了512帧（初始状态）的记忆特征状态，对应一帧10ms，总计是5.12s的历史数据。各stack的时间压缩长度不同，折成帧数是 256/128/64/32
+        # 第二类输入要求的 116个 状态向量 主要含三类：
+        # 1. 2 个全局状态：processed_lens (1,) int64、embed_states (1,128,3,19) float
+        # 2. 76 个 KV Cache 状态, 19 层 × 每层 4 个，形状 (T = 256/128/64/32, batch = 1, key_dim = 128 或 256)
         # 3.1 76 个 CNN 边界状态, 19 层 × 每层 4 个，由于Zipformer架构的前馈层含CNN层，而流式架构中在边界不使用padding，而是直接使用历史数据进行因果卷积
         # 3.2 因此，需要在输入1d 特征左侧拼接历史特征，历史特征的时间长度与卷积核在边界需要补的数据一致，(batch = 1,Channels = 256/192/.. , T = kernel_size)
         self._state_proto = []
@@ -277,6 +278,7 @@ class AsrDecoder:
                     self.decoder_out = self.run_decoder(self.hyp[-self.context_size:])
                     
         # 判断本轮输入的480ms音频，是否识别出了非 blank的token序列 self.hyp
+        # 这里单独一个模块，考虑到Beam Search 必须等一个完整的计算周期（Chunk）结束后，才能输出确定的文本。虽然这里是贪心搜索，这里做兼容。
         if n_new:
             # 1. 有新字吐出，将 token id 列表转换为对应的字符串列表
             token_str_list = []
