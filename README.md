@@ -233,6 +233,18 @@ python -I test_spectrogram_cv_mini.py   # 只看前端产出的语谱图
 
 ---
 
+## C++ 移植计划
+
+最终交付是 C/C++ 库：外部拿到麦克风 PCM 后直接调用，库内完成前端 → onnxruntime 推理 → 文本。
+
+1. **wav 前端 + 可视化**：C++ 复刻 `test_spectrogram_cv_mini.py`（读 wav、逐帧预处理、OpenCV 语谱图），先不接模型。
+2. **wav ASR**：链接 onnxruntime C++ 库，移植贪心搜索与文本还原。
+3. **产出库**：封装成库（初始化 / reset / 喂 PCM / 取文本），麦克风采集留在库外。
+
+每步都与 Python 版逐点或逐 token 对拍；`src/` 只作参考实现，不是部署产物。
+
+---
+
 ## 已知问题
 
 1. **`high_freq` 口径分歧未实测**。官方 `test_onnx.py` 取 8000 Hz（Nyquist），

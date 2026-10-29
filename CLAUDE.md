@@ -22,6 +22,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 环境：Python 3.10，conda 环境 `py310-gpu`。
 
+## 项目方向：转 C++ 部署
+
+最终交付形态是一个 C/C++ 库，外部系统拿到麦克风 PCM 后直接调用，库内部完成
+前端 → onnxruntime 推理 → 文本还原。Python 的 `src/` 是**参考实现**，不是部署产物。
+路线分三步，每步独立验证：
+
+1. **wav 前端 + 可视化**：用 C++ 复刻 `test_spectrogram_cv_mini.py` 的链路
+   （读 wav、显式逐帧预处理、OpenCV 滚动语谱图），先不接模型；
+   特征与 `src/audio_preprocess.py` 逐点对拍。
+2. **wav ASR**：链接 onnxruntime C++ 库，移植 `src/asr_decode.py` 的贪心搜索与文本还原，
+   与 Python 版逐 token 对拍。
+3. **产出库**：封装成库（初始化 / reset / 喂 PCM / 取文本），麦克风采集留在库外，
+   外部按块喂音频，库内部维护跨块状态并增量出字。
+
+写新代码时优先考虑可移植性：显式逐帧循环、不依赖 Python 专有行为、不引入额外框架；
+下面「必须记住的不变量」在 C++ 版里同样成立。
+
 ## 常用命令
 
 ```bash
