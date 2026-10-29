@@ -61,10 +61,10 @@ python -I test_spectrogram_cv_mini.py # 只看 wav 的语谱图，不加载 onnx
 ### 打包
 
 ```bash
-git archive --format=zip --output=../audio_ai_process.zip HEAD
+git archive --format=zip --output=audio_ai_process.zip HEAD
 ```
 
-把当前工作区的内容打成 `../audio_ai_process.zip`：`weight/`、`sharpa-onnx/`、wav
+把当前工作区的内容打成当前目录下的 `audio_ai_process.zip`：`weight/`、`sharpa-onnx/`、wav
 等被 `.gitignore` 排除的东西不会进去。`git archive` 只打包已提交的内容，工作区里
 没提交的改动要先 `git add` / `git commit` 才会进包。
 
