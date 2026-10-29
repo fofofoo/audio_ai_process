@@ -20,7 +20,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 运行时依赖：`onnxruntime` + `numpy` + `soundfile` + `sounddevice` + `opencv-python`。
 `kaldi_native_fbank` 只在开发期充当「数值标尺」，不是运行时依赖。
 
-环境：Python 3.10，conda 环境 `py310-gpu`。
+环境：Python 3.10，conda 环境 `py310-gpu`。跑脚本时写全该环境的解释器路径
+（`C:/Users/Liyun/anaconda3/envs/py310-gpu/python.exe`），裸 `python` 会落到 base 且缺依赖。
 
 ## 项目方向：转 C++ 部署
 
@@ -50,9 +51,13 @@ python -I test_wav_asr_mini.py
 
 # 只看 wav 的滚动语谱图（不加载 onnx）
 python -I test_spectrogram_cv_mini.py
+
+# 打包（不含 weight/、sharpa-onnx/、wav 等被 .gitignore 排除的项）
+git archive --format=zip --output=audio_ai_process.zip HEAD
 ```
 
 不收命令行参数：onnx 与词表路径、执行器、麦克风设备都硬编码在入口文件顶部。
+没有测试框架，验证方式就是跑上面三个入口；只想确认链路正常，跑 `test_wav_asr_mini.py`。
 
 ## 架构
 
@@ -77,11 +82,21 @@ python -I test_spectrogram_cv_mini.py
 代码组织是刻意的：显式逐帧循环、三类零耦合、不引入 scipy（窗函数手算）、注释按最密写。
 目标是能逐行对照移植到 C++。
 
+### 模型结构速记
+
+- `encoder_embed` **不是**「两层 1D 卷积压 4 倍」：它是 3 层 2D 卷积（1→8→32→128）
+  + ConvNeXt 块，时间只压约 2 倍（61→27），频率 80→19，最后投影到 192 维。
+- 6 个 stack（192/256/512/768/512/256）是 U-Net 式「先压缩再恢复」，整体再压 2 倍，
+  所以 48 帧输入对应 12 帧输出。512 是第 3 个 stack 的宽度，也是 `encoder_out` 维度。
+- 116 个状态 = 2 个全局 + 19×4 注意力缓存（key / value / value2 / non-linear attn）
+  + 19×2 卷积缓存。
+- 结构、逐层形状与输入输出契约见 [落地报告](doc/src-预处理与模型框架-ASR落地报告.md)。
+
 ## 必须记住的不变量
 
 这几条写错了不会报错，只会静默多吐出几个 token 或尾字丢失：
 
-- **`T = 61` 是输入帧数，不是输出帧数**。时间轴每次只前进 `decode_chunk_len = 48` 帧（480 ms），多出的 13 帧是卷积模块的重叠上下文；实测每个 chunk 输出 **12** 帧。（`T` / `decode_chunk_len` / `context_size` 都由 ONNX 输入签名自动推导，上例是当前权重的取值，代码里没有硬编码。）
+- **`T = 61` 是输入帧数，不是输出帧数**。时间轴每次只前进 `decode_chunk_len = 48` 帧（480 ms），多出的 13 帧是卷积模块的重叠上下文；实测每个 chunk 输出 **12** 帧。（`T` / `decode_chunk_len` 从 encoder 的 `custom_metadata_map` 读出，`context_size` 来自 decoder 元数据；状态张量初值由 ONNX 输入签名推导。上例是当前权重的取值，代码里没有硬编码。）
 - **`encoder_out.shape[1]` 必须取运行时值**，写死 `T` 会错。
 - **blank 不刷新 decoder**（贪心搜索省算力的关键）；`blank_id` 从 `tokens.txt` 查 `<blk>`，不硬编码 0。
 - **解码循环尾部补 100 帧特征域的 0**（约 1 秒）。补的 0 是 log 域对应能量 1，不是静音值，照抄官方做法。不补则最后一段凑不满 chunk 会被整段丢掉。
