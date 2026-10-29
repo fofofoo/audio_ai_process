@@ -58,6 +58,23 @@ python -I test_spectrogram_cv_mini.py # 只看 wav 的语谱图，不加载 onnx
 不收命令行参数：三个 onnx 与词表的路径、执行器顺序、麦克风设备都硬编码在文件顶部；
 想看设备列表，把入口第 1 节里 `list_devices()` 那一行的注释取消即可。
 
+### 打包
+
+用 `git archive` 把当前分支**已提交**的内容打成一个 zip（`weight/`、`sharpa-onnx/`、
+wav 等被 `.gitignore` 排除的东西不会进去）：
+
+```bash
+# 文件名带 commit 短哈希，输出到仓库上一级目录
+git archive --format=zip \
+  --output=../audio_ai_process-$(git rev-parse --short HEAD).zip HEAD
+
+# 打包指定分支（如 mini）而不是当前 HEAD
+git archive --format=zip --output=../audio_ai_process-mini.zip mini
+```
+
+`git archive` 只看提交，未提交的改动和未跟踪文件不会被打包——要包含就先
+`git add` 并 `git commit`。上面的 `$(...)` 是 POSIX shell 写法，Git Bash 下可用。
+
 ---
 
 ## 项目结构
