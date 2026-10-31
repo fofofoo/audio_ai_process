@@ -417,7 +417,7 @@ ASCII，中文识别结果以终端为准。
 |---|---|---|
 | `AudioPreprocess` | `preprocess.cpp/h` | 只依赖 FFT 库；维护样本缓冲与帧游标 |
 | `AsrDecoder` | `decoder.cpp/h` | 只依赖 onnxruntime C API；session 由外部创建 |
-| `MicClient` | 库外 | 麦克风采集交给调用方，库只接收 PCM |
+| `MicClient` | 独立采集库 `mic_client.cpp/h` | 与 ASR 库零耦合：打开设备、按块输出 PCM；ASR 库只接收 PCM |
 | `SpectrogramImage` | 可选 `viz.cpp`（调试用） | 不属于交付库 |
 
 ### 7.2 建议的对外库接口

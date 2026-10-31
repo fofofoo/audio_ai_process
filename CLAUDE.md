@@ -25,8 +25,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目方向：转 C++ 部署
 
-最终交付形态是一个 C/C++ 库，外部系统拿到麦克风 PCM 后直接调用，库内部完成
-前端 → onnxruntime 推理 → 文本还原。Python 的 `src/` 是**参考实现**，不是部署产物。
+最终交付形态是**两个 C/C++ 库**：ASR 处理库（库内完成前端 → onnxruntime 推理 → 文本还原）
+和麦克风采集库（PortAudio）。两者零耦合，ASR 库只接收 PCM；麦克风客户端源码也纳入项目，
+因此 wav 与 mic 两条链路可以同时验证。Python 的 `src/` 是**参考实现**，不是部署产物。
 路线分三步，每步独立验证：
 
 1. **wav 前端 + 可视化**：用 C++ 复刻 `test_spectrogram_cv_mini.py` 的链路
@@ -34,8 +35,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    特征与 `src/audio_preprocess.py` 逐点对拍。
 2. **wav ASR**：链接 onnxruntime C++ 库，移植 `src/asr_decode.py` 的贪心搜索与文本还原，
    与 Python 版逐 token 对拍。
-3. **产出库**：封装成库（初始化 / reset / 喂 PCM / 取文本），麦克风采集留在库外，
-   外部按块喂音频，库内部维护跨块状态并增量出字。
+3. **拆成两个库**：ASR 处理库（初始化 / reset / 喂 PCM / 取文本，内部维护跨块状态并增量
+   出字）+ 麦克风采集库（打开设备、按块输出 PCM）；两库零耦合，wav 与 mic 一起验收。
 
 写新代码时优先考虑可移植性：显式逐帧循环、不依赖 Python 专有行为、不引入额外框架；
 下面「必须记住的不变量」在 C++ 版里同样成立。
